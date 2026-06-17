@@ -46,12 +46,15 @@ msg_queue = queue.Queue()
 
 # ==================== Utility Functions ====================
 def run_cmd(cmd, timeout=30):
-    """Run a shell command and return (returncode, stdout)."""
+    """Run a shell command and return (returncode, stdout+stderr combined)."""
     try:
         r = subprocess.run(
-            cmd, shell=True, capture_output=True, text=True, timeout=timeout
+            cmd, shell=True, capture_output=True, timeout=timeout,
+            encoding="utf-8", errors="replace"
         )
-        return r.returncode, r.stdout.strip()
+        # Docker logs writes to stderr, so combine both
+        output = (r.stdout or "") + (r.stderr or "")
+        return r.returncode, output.strip()
     except subprocess.TimeoutExpired:
         return -1, ""
     except Exception as e:
@@ -515,7 +518,7 @@ class DiagnosticApp:
         # Check docker logs
         saw_ota = False; saw_ws = False
         if self.state.get("DockerOk"):
-            rc, sl = run_cmd("docker logs --since 60s xiaozhi-esp32-server 2>&1", timeout=10)
+            rc, sl = run_cmd("docker logs --since 60s xiaozhi-esp32-server", timeout=10)
             if sl:
                 if "conn - Headers" in sl:
                     saw_ws = True
@@ -566,7 +569,7 @@ class DiagnosticApp:
             self._verdict(CV, "Docker not running.", "#ce3a3a")
             msg_queue.put(("done",)); return
 
-        rc, log = run_cmd("docker logs --tail 600 xiaozhi-esp32-server 2>&1", timeout=20)
+        rc, log = run_cmd("docker logs --tail 600 xiaozhi-esp32-server", timeout=20)
         if not log:
             self._verdict(CV, "No logs found.", "#d69e14")
             msg_queue.put(("done",)); return

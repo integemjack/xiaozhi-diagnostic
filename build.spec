@@ -46,16 +46,3 @@ exe = EXE(
     entitlements_file=None,
     icon=None,
 )
-
-# macOS .app bundle
-if sys.platform == 'darwin':
-    app = BUNDLE(
-        exe,
-        name=f'{name}.app',
-        icon=None,
-        bundle_identifier='com.integem.xiaozhi-diagnostic',
-        info_plist={
-            'NSHighResolutionCapable': 'True',
-            'CFBundleShortVersionString': '1.0.0',
-        },
-    )

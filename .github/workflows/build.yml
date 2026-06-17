@@ -45,25 +45,16 @@ jobs:
       - name: Install dependencies
         run: pip install pyinstaller==6.11.1
 
-      - name: Build App
-        run: pyinstaller build.spec --noconfirm
-
-      - name: Create DMG
+      - name: Build single executable
         run: |
-          # Create a DMG from the .app bundle
-          mkdir -p dmg_contents
-          cp -r dist/XiaozhiDiagnostic.app dmg_contents/
-          ln -s /Applications dmg_contents/Applications
-          hdiutil create -volname "XiaozhiDiagnostic" \
-            -srcfolder dmg_contents \
-            -ov -format UDZO \
-            dist/XiaozhiDiagnostic.dmg
+          pyinstaller --onefile --windowed --name XiaozhiDiagnostic-macOS src/main.py --noconfirm
+          chmod +x dist/XiaozhiDiagnostic-macOS
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: XiaozhiDiagnostic-macOS
-          path: dist/XiaozhiDiagnostic.dmg
+          path: dist/XiaozhiDiagnostic-macOS
 
   release:
     needs: [build-windows, build-macos]
@@ -87,5 +78,5 @@ jobs:
         with:
           files: |
             artifacts/XiaozhiDiagnostic.exe
-            artifacts/XiaozhiDiagnostic.dmg
+            artifacts/XiaozhiDiagnostic-macOS
           generate_release_notes: true

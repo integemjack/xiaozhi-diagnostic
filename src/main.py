@@ -1563,11 +1563,17 @@ class DiagnosticApp:
         truth). We deliberately do NOT fall back to the .last_ip file: that file
         is only an informational cache and could drift from what's actually
         configured in the DB."""
+        # The IP lives in sys_params rows server.websocket / server.ota
+        # (e.g. ws://192.168.20.10:8000/... , http://192.168.20.10:8002/...).
+        # Older naming ('websocket_url'/'ota_url') kept as a fallback. We fetch
+        # all of them and let the regex below find the first IP, so a null/empty
+        # row doesn't hide the one that actually holds the address.
         out = docker_exec_sql(
-            "SELECT param_value FROM sys_params WHERE param_code IN ('websocket_url','ota_url') LIMIT 1"
+            "SELECT param_value FROM sys_params "
+            "WHERE param_code IN ('server.websocket','server.ota','websocket_url','ota_url')"
         )
         if out:
-            # Extract IP from URL like ws://192.168.1.5:8000/xiaozhi/v1/
+            # Extract IP from a URL like ws://192.168.1.5:8000/xiaozhi/v1/
             m = re.search(r"(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})", out)
             if m:
                 return m.group(1)

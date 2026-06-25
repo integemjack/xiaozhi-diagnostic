@@ -1119,47 +1119,37 @@ class DiagnosticApp:
                     new_ip = next((ip for ip in lan_ips if ip.startswith("192.168.")), lan_ips[0])
                     self._log(LOG, f"Auto-selected: {new_ip}")
 
-            # Apply IP change if needed
-            if current_ip and current_ip == new_ip:
-                self._item(L, "\u2714", f"IP already correct: {new_ip}")
-                self._log(LOG, "IP unchanged, refreshing Redis cache...")
-                run_cmd("docker exec xiaozhi-esp32-server-redis redis-cli FLUSHALL", timeout=10)
-            else:
-                self._item(L, "\u2022", f"Setting IP: {current_ip or '(default)'} → {new_ip}")
-                old_ip = current_ip if current_ip else "192.168.20.42"
-                sql_update = (
-                    f"UPDATE sys_params SET param_value = REPLACE(param_value, '{old_ip}', '{new_ip}') "
-                    f"WHERE param_value LIKE '%{old_ip}%'; "
-                    f"UPDATE ai_model_config SET config_json = REPLACE(config_json, '{old_ip}', '{new_ip}') "
-                    f"WHERE config_json LIKE '%{old_ip}%';"
-                )
-                cmd = f'docker exec {DB_CONTAINER} mysql -u{DB_USER} -p{DB_PASS} {DB_NAME} -e "{sql_update}"'
-                rc, out = run_cmd(cmd, timeout=30)
-                if rc == 0:
-                    self._item(L, "\u2714", f"IP updated to {new_ip}")
-                    self._log(LOG, "[OK] Database IP updated")
-                else:
-                    self._item(L, "\u2718", f"IP update failed: {out[:100]}")
-                    self._log(LOG, f"[FAIL] {out}")
-
-                # Flush Redis
-                run_cmd("docker exec xiaozhi-esp32-server-redis redis-cli FLUSHALL", timeout=10)
-                self._log(LOG, "[OK] Redis cache cleared")
-
-                # Save .last_ip
-                try:
-                    with open(LAST_IP_FILE, "w") as f:
-                        f.write(new_ip)
-                except Exception:
-                    pass
-
-                # Restart services to apply new IP
-                self._item(L, "\u2022", "Restarting services to apply IP...")
-                self._verdict(V, "Restarting services...", "#3c424e")
-                restart_cmd = f'docker compose -p xiaozhi -f "{compose_file}" restart'
-                run_cmd(restart_cmd, timeout=120)
-                time.sleep(10)
-                self._item(L, "\u2714", "Services restarted")
+            # Apply + verify the server IP. If the database doesn't end up
+            # matching the selected IP, loop back and re-run the set (Phase 4).
+            max_ip_attempts = 3
+            ip_ok = False
+            for attempt in range(1, max_ip_attempts + 1):
+                cur = self._get_current_ip_from_db()
+                if cur == new_ip:
+                    self._item(L, "✔", f"Server IP correct in database: {new_ip}")
+                    self._log(LOG, f"[OK] DB IP already {new_ip}; refreshing Redis")
+                    run_cmd("docker exec xiaozhi-esp32-server-redis redis-cli FLUSHALL", timeout=10)
+                    ip_ok = True
+                    break
+                self._item(L, "•",
+                           f"Setting IP {cur or '(default)'} → {new_ip} "
+                           f"(attempt {attempt}/{max_ip_attempts})...")
+                self._apply_server_ip(new_ip, cur, compose_file, L, LOG, V)
+                # Verify it actually took (DB is the source of truth)
+                time.sleep(2)
+                check = self._get_current_ip_from_db()
+                if check == new_ip:
+                    self._item(L, "✔", f"Verified: database IP = {new_ip}")
+                    self._log(LOG, f"[OK] Verified DB IP = {new_ip}")
+                    ip_ok = True
+                    break
+                self._item(L, "!",
+                           f"DB IP is {check or '(none)'}, expected {new_ip} → retrying...")
+                self._log(LOG, f"[WARN] DB IP {check} != {new_ip}; will re-run Phase 4")
+            if not ip_ok:
+                self._item(L, "✘",
+                           f"Could not set server IP to {new_ip} after {max_ip_attempts} attempts")
+                self._verdict(V, f"Failed to configure server IP ({new_ip}). Check DB container.", "#ce3a3a")
 
             # Show final OTA address
             ota_addr = f"http://{new_ip}:{WEB_PORT}/xiaozhi/ota/"
@@ -1220,23 +1210,6 @@ class DiagnosticApp:
 
         if self.cancel:
             msg_queue.put(("progress", 0)); msg_queue.put(("done",)); return
-
-        # ===== Phase 7: Verify server IP in database =====
-        self._log(LOG, "")
-        self._log(LOG, "===== Phase 7: Verify Server IP =====")
-        self._item(L, "•", "Phase 7: Verifying server IP in database...")
-        self._verdict(V, "Phase 7: Verifying server IP...", "#3c424e")
-        db_ip = self._get_current_ip_from_db()
-        expected_ip = new_ip if lan_ips else None
-        if not db_ip:
-            self._item(L, "!", "Could not read server IP from database")
-            self._log(LOG, "[WARN] No IP configured in database")
-        elif expected_ip and db_ip != expected_ip:
-            self._item(L, "!", f"DB IP {db_ip} != selected {expected_ip}")
-            self._log(LOG, f"[WARN] Database IP ({db_ip}) does not match selected IP ({expected_ip})")
-        else:
-            self._item(L, "✔", f"Server IP in database: {db_ip}")
-            self._log(LOG, f"[OK] Database IP verified: {db_ip}")
 
         # ===== Done =====
         self._log(LOG, "")
@@ -1550,6 +1523,40 @@ class DiagnosticApp:
 
         msg_queue.put(("progress", 0))
         msg_queue.put(("done",))
+
+    def _apply_server_ip(self, new_ip, current_ip, compose_file, L, LOG, V):
+        """Write new_ip into the database (sys_params + ai_model_config),
+        flush Redis and restart services so it takes effect. Returns the SQL
+        exit code."""
+        old_ip = current_ip if current_ip else "192.168.20.42"
+        sql_update = (
+            f"UPDATE sys_params SET param_value = REPLACE(param_value, '{old_ip}', '{new_ip}') "
+            f"WHERE param_value LIKE '%{old_ip}%'; "
+            f"UPDATE ai_model_config SET config_json = REPLACE(config_json, '{old_ip}', '{new_ip}') "
+            f"WHERE config_json LIKE '%{old_ip}%';"
+        )
+        cmd = f'docker exec {DB_CONTAINER} mysql -u{DB_USER} -p{DB_PASS} {DB_NAME} -e "{sql_update}"'
+        rc, out = run_cmd(cmd, timeout=30)
+        if rc == 0:
+            self._log(LOG, "[OK] Database IP update executed")
+        else:
+            self._item(L, "✘", f"IP update SQL failed: {out[:100]}")
+            self._log(LOG, f"[FAIL] {out}")
+        # Flush Redis cache so the new IP is served
+        run_cmd("docker exec xiaozhi-esp32-server-redis redis-cli FLUSHALL", timeout=10)
+        # Informational cache only (not used for IP determination)
+        try:
+            with open(LAST_IP_FILE, "w") as f:
+                f.write(new_ip)
+        except Exception:
+            pass
+        # Restart services to apply the new IP
+        self._item(L, "•", "Restarting services to apply IP...")
+        self._verdict(V, "Restarting services...", "#3c424e")
+        run_cmd(f'docker compose -p xiaozhi -f "{compose_file}" restart', timeout=120)
+        time.sleep(10)
+        self._item(L, "✔", "Services restarted")
+        return rc
 
     def _get_current_ip_from_db(self):
         """Read the current server IP from the database (the single source of

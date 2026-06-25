@@ -160,14 +160,20 @@ def make_ssl_context(insecure=False):
         ctx = ssl.create_default_context()
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE
-        return ctx
-    # Prefer certifi's bundled CA roots (reliable inside frozen apps).
-    try:
-        import certifi
-        return ssl.create_default_context(cafile=certifi.where())
-    except Exception:
-        pass
-    return ssl.create_default_context()
+    else:
+        # Prefer certifi's bundled CA roots (reliable inside frozen apps).
+        try:
+            import certifi
+            ctx = ssl.create_default_context(cafile=certifi.where())
+        except Exception:
+            ctx = ssl.create_default_context()
+    # The packaged app ships Python 3.11 (OpenSSL 3.x), which raises
+    # "UNEXPECTED_EOF_WHILE_READING" when a server closes the TLS connection
+    # without a clean close_notify. Plain file servers (like the package host)
+    # routinely do this; tolerate it the way OpenSSL 1.1 / LibreSSL did.
+    if hasattr(ssl, "OP_IGNORE_UNEXPECTED_EOF"):
+        ctx.options |= ssl.OP_IGNORE_UNEXPECTED_EOF
+    return ctx
 
 
 def urlopen_safe(req, timeout, log=None):
@@ -1444,47 +1450,168 @@ class DiagnosticApp:
         return skipped
 
     def _do_download(self, zip_path, L, LOG, V):
-        """Perform the actual file download. Returns True if successful."""
-        import urllib.request
-
-        try:
-            self._item(L, "\u2022", f"Downloading from: {XIAOZHI_ZIP_URL}")
-            self._log(LOG, f"Downloading {XIAOZHI_ZIP_URL} ...")
-
-            req = urllib.request.Request(XIAOZHI_ZIP_URL)
-            req.add_header("User-Agent", "XiaozhiDiagnostic/1.0")
-            resp = urlopen_safe(req, 120, log=lambda m: self._log(LOG, m))
-
-            total_size = resp.headers.get("Content-Length")
-            total_size = int(total_size) if total_size else 0
-            downloaded = 0
-            block_size = 8192
-
-            with open(zip_path, "wb") as f:
-                while True:
+        """Download the package robustly: several attempts with HTTP Range
+        resume so a connection that drops part-way (or a TLS unclean shutdown)
+        doesn't restart from zero, then fall back to the system curl. Returns
+        True only when a complete file is on disk."""
+        attempts = 5
+        last_err = ""
+        for attempt in range(1, attempts + 1):
+            try:
+                ok, complete, last_err = self._download_attempt(
+                    zip_path, L, LOG, V, attempt, attempts)
+                if complete:
+                    return True
+                if self.cancel:
+                    return False
+            except Exception as e:
+                last_err = str(e)
+                self._log(LOG, f"[WARN] Attempt {attempt}/{attempts} failed: {last_err}")
+                if self.cancel:
+                    return False
+            if attempt < attempts:
+                wait = min(2 * attempt, 8)
+                self._item(L, "\u21bb",
+                           f"Connection interrupted, retrying in {wait}s "
+                           f"(attempt {attempt + 1}/{attempts})...")
+                self._verdict(V, f"Retrying download in {wait}s...", "#d69e14")
+                for _ in range(wait):
                     if self.cancel:
-                        self._verdict(V, "Download cancelled.", "#d69e14")
                         return False
-                    chunk = resp.read(block_size)
-                    if not chunk:
-                        break
-                    f.write(chunk)
-                    downloaded += len(chunk)
-                    if total_size:
-                        pct = int(downloaded / total_size * 100)
-                        self._verdict(V,
-                                      f"Downloading... {downloaded // (1024*1024)} MB / {total_size // (1024*1024)} MB ({pct}%)",
-                                      "#3c424e")
+                    time.sleep(1)
 
-            self._item(L, "\u2714", f"Download complete: {XIAOZHI_ZIP_NAME} ({downloaded // (1024*1024)} MB)")
-            self._log(LOG, f"Download complete. Size: {downloaded // (1024*1024)} MB")
+        # Python attempts exhausted -> try the system curl, which uses its own
+        # TLS stack and resume logic and often succeeds where urllib does not.
+        self._item(L, "\u2022", "Falling back to system curl...")
+        self._log(LOG, "[INFO] urllib attempts exhausted; trying system curl...")
+        if self._download_via_curl(zip_path, L, LOG, V):
             return True
 
-        except Exception as e:
-            self._item(L, "\u2718", f"Download failed: {str(e)}")
-            self._log(LOG, f"[FAIL] Download error: {str(e)}")
-            self._verdict(V, f"Download failed: {str(e)}", "#ce3a3a")
+        self._item(L, "\u2718", f"Download failed: {last_err}")
+        self._log(LOG, f"[FAIL] Download error after {attempts} attempts: {last_err}")
+        self._verdict(V,
+                      "Download failed after several retries. Check your "
+                      "network/VPN/firewall and try [Re-download].", "#ce3a3a")
+        return False
+
+    def _download_attempt(self, zip_path, L, LOG, V, attempt, attempts):
+        """One download pass with HTTP Range resume.
+        Returns (ok, complete, err): `complete` is True only when the full file
+        is on disk; `ok` False means the pass aborted (e.g. cancelled)."""
+        import urllib.request
+        import urllib.error
+
+        existing = os.path.getsize(zip_path) if os.path.exists(zip_path) else 0
+
+        req = urllib.request.Request(XIAOZHI_ZIP_URL)
+        req.add_header("User-Agent", "XiaozhiDiagnostic/1.0")
+        if existing > 0:
+            req.add_header("Range", f"bytes={existing}-")
+            self._item(L, "\u2022",
+                       f"Resuming download at {existing // (1024 * 1024)} MB "
+                       f"(attempt {attempt}/{attempts})...")
+            self._log(LOG,
+                      f"Resuming at byte {existing} (attempt {attempt}/{attempts})")
+        else:
+            self._item(L, "\u2022", f"Downloading from: {XIAOZHI_ZIP_URL}")
+            self._log(LOG,
+                      f"Downloading {XIAOZHI_ZIP_URL} (attempt {attempt}/{attempts})...")
+
+        try:
+            resp = urlopen_safe(req, 120, log=lambda m: self._log(LOG, m))
+        except urllib.error.HTTPError as he:
+            # 416 = Range Not Satisfiable -> we already have the whole file.
+            if he.code == 416 and existing > 0:
+                self._item(L, "\u2714",
+                           f"Already fully downloaded ({existing // (1024 * 1024)} MB)")
+                return (True, True, "")
+            raise
+
+        status = getattr(resp, "status", None) or resp.getcode() or 200
+        if existing > 0 and status == 206:
+            mode = "ab"
+            cr = resp.headers.get("Content-Range", "")
+            total_size = int(cr.split("/")[-1]) if "/" in cr else 0
+        else:
+            # Server ignored the Range header (sent 200) -> start from scratch.
+            mode = "wb"
+            existing = 0
+            cl = resp.headers.get("Content-Length")
+            total_size = int(cl) if cl else 0
+
+        downloaded = existing
+        block_size = 256 * 1024
+        with open(zip_path, mode) as f:
+            while True:
+                if self.cancel:
+                    self._verdict(V, "Download cancelled.", "#d69e14")
+                    return (False, False, "")
+                chunk = resp.read(block_size)
+                if not chunk:
+                    break
+                f.write(chunk)
+                downloaded += len(chunk)
+                if total_size:
+                    pct = int(downloaded / total_size * 100)
+                    self._verdict(V,
+                                  f"Downloading... {downloaded // (1024 * 1024)} MB / "
+                                  f"{total_size // (1024 * 1024)} MB ({pct}%)",
+                                  "#3c424e")
+                else:
+                    self._verdict(V,
+                                  f"Downloading... {downloaded // (1024 * 1024)} MB",
+                                  "#3c424e")
+
+        final = os.path.getsize(zip_path)
+        complete = (final >= total_size) if total_size > 0 else (final > 0)
+        if complete:
+            self._item(L, "\u2714",
+                       f"Download complete: {XIAOZHI_ZIP_NAME} "
+                       f"({final // (1024 * 1024)} MB)")
+            self._log(LOG, f"Download complete. Size: {final // (1024 * 1024)} MB")
+            return (True, True, "")
+
+        err = (f"stream ended early at {final // (1024 * 1024)} MB / "
+               f"{total_size // (1024 * 1024)} MB")
+        self._log(LOG, f"[WARN] {err}")
+        return (True, False, err)
+
+    def _download_via_curl(self, zip_path, L, LOG, V):
+        """Fallback download using the system curl. Uses its own TLS stack and
+        resumes (-C -) so partial bytes from urllib attempts are reused."""
+        curl = shutil.which("curl")
+        if not curl:
+            self._log(LOG, "[INFO] curl not found; cannot use fallback")
             return False
+        self._verdict(V, "Downloading via curl (this can take a while)...", "#3c424e")
+        cmd = [curl, "-L", "--fail", "--retry", "5", "--retry-delay", "3",
+               "-C", "-", "-A", "XiaozhiDiagnostic/1.0",
+               "-o", zip_path, XIAOZHI_ZIP_URL]
+        try:
+            proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL,
+                                    stderr=subprocess.DEVNULL)
+            while proc.poll() is None:
+                if self.cancel:
+                    proc.terminate()
+                    self._verdict(V, "Download cancelled.", "#d69e14")
+                    return False
+                if os.path.exists(zip_path):
+                    mb = os.path.getsize(zip_path) // (1024 * 1024)
+                    self._verdict(V, f"Downloading via curl... {mb} MB", "#3c424e")
+                time.sleep(1)
+            rc = proc.returncode
+        except Exception as e:
+            self._log(LOG, f"[FAIL] curl error: {str(e)}")
+            return False
+
+        if rc == 0 and os.path.exists(zip_path) and os.path.getsize(zip_path) > 0:
+            final = os.path.getsize(zip_path)
+            self._item(L, "\u2714",
+                       f"Download complete via curl ({final // (1024 * 1024)} MB)")
+            self._log(LOG, f"[OK] curl download complete: {final // (1024 * 1024)} MB")
+            return True
+        self._log(LOG, f"[FAIL] curl exited with code {rc}")
+        return False
 
     def _worker_download(self):
         """Worker thread: download xiaozhi.zip and extract to current directory."""

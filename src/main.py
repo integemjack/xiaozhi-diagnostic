@@ -1474,15 +1474,6 @@ class DiagnosticApp:
         self._item(L, "\u2714", "Redis cache cleared")
         self._log(LOG, "[OK] Redis FLUSHALL")
 
-        # Save new IP to .last_ip file
-        last_ip_path = LAST_IP_FILE
-        try:
-            with open(last_ip_path, "w") as f:
-                f.write(new_ip)
-            self._log(LOG, f"Saved new IP to: {last_ip_path}")
-        except Exception:
-            pass
-
         # Verify the replacement
         self._item(L, "\u2022", "Verifying...")
         verify_sql = (
@@ -1544,12 +1535,6 @@ class DiagnosticApp:
             self._log(LOG, f"[FAIL] {out}")
         # Flush Redis cache so the new IP is served
         run_cmd("docker exec xiaozhi-esp32-server-redis redis-cli FLUSHALL", timeout=10)
-        # Informational cache only (not used for IP determination)
-        try:
-            with open(LAST_IP_FILE, "w") as f:
-                f.write(new_ip)
-        except Exception:
-            pass
         # Restart services to apply the new IP
         self._item(L, "•", "Restarting services to apply IP...")
         self._verdict(V, "Restarting services...", "#3c424e")

@@ -1,1 +1,2 @@
 pyinstaller==6.11.1
+certifi>=2024.2.2

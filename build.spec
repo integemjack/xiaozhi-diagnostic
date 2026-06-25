@@ -3,6 +3,14 @@
 import sys
 import os
 
+# Bundle certifi's CA root bundle so TLS verification works inside the
+# frozen app even on machines whose Python lacks system root certificates.
+try:
+    from PyInstaller.utils.hooks import collect_data_files
+    certifi_datas = collect_data_files('certifi')
+except Exception:
+    certifi_datas = []
+
 block_cipher = None
 name = "XiaozhiDiagnostic"
 
@@ -10,8 +18,8 @@ a = Analysis(
     ['src/main.py'],
     pathex=[],
     binaries=[],
-    datas=[],
-    hiddenimports=[],
+    datas=certifi_datas,
+    hiddenimports=['certifi'],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

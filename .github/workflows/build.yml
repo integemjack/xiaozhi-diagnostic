@@ -45,7 +45,7 @@ jobs:
           python-version: '3.11'
 
       - name: Install dependencies
-        run: pip install pyinstaller==6.11.1
+        run: pip install -r requirements.txt
 
       - name: Build EXE
         run: pyinstaller build.spec --noconfirm
@@ -94,12 +94,13 @@ jobs:
           python-version: '3.11'
 
       - name: Install dependencies
-        run: pip install pyinstaller==6.11.1
+        run: pip install -r requirements.txt
 
       - name: Build macOS app bundle
         run: |
           pyinstaller --windowed --name XiaozhiDiagnostic \
             --osx-bundle-identifier com.xiaozhi.diagnostic \
+            --collect-data certifi \
             src/main.py --noconfirm
           chmod +x dist/XiaozhiDiagnostic.app/Contents/MacOS/XiaozhiDiagnostic
 

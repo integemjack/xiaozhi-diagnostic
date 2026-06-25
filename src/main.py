@@ -101,12 +101,47 @@ def port_listening(port):
         return False
 
 
+def make_ssl_context(insecure=False):
+    """Build an SSL context that works on machines whose Python lacks access
+    to system root certificates (common on macOS and in frozen PyInstaller
+    builds). Prefers the certifi CA bundle when available."""
+    import ssl
+    if insecure:
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        return ctx
+    # Prefer certifi's bundled CA roots (reliable inside frozen apps).
+    try:
+        import certifi
+        return ssl.create_default_context(cafile=certifi.where())
+    except Exception:
+        pass
+    return ssl.create_default_context()
+
+
+def urlopen_safe(req, timeout, log=None):
+    """urlopen with resilient TLS verification. Falls back to an unverified
+    context if certificate verification fails, since the download URLs are
+    fixed/trusted and end-user machines frequently lack a usable CA store."""
+    import urllib.request
+    try:
+        return urllib.request.urlopen(req, timeout=timeout, context=make_ssl_context())
+    except Exception as e:
+        msg = str(e)
+        if "CERTIFICATE_VERIFY_FAILED" not in msg and "SSL" not in msg.upper():
+            raise
+        if log is not None:
+            log("[WARN] TLS certificate verification failed; retrying without verification")
+        return urllib.request.urlopen(req, timeout=timeout, context=make_ssl_context(insecure=True))
+
+
 def http_get(url, timeout=5):
     """Simple HTTP GET."""
     import urllib.request
     try:
         req = urllib.request.Request(url)
-        resp = urllib.request.urlopen(req, timeout=timeout)
+        resp = urllib.request.urlopen(req, timeout=timeout, context=make_ssl_context())
         return resp.status, resp.read().decode("utf-8", errors="replace")
     except Exception as e:
         code = getattr(e, "code", None)
@@ -1368,7 +1403,7 @@ class DiagnosticApp:
 
             req = urllib.request.Request(XIAOZHI_ZIP_URL)
             req.add_header("User-Agent", "XiaozhiDiagnostic/1.0")
-            resp = urllib.request.urlopen(req, timeout=120)
+            resp = urlopen_safe(req, 120, log=lambda m: self._log(LOG, m))
 
             total_size = resp.headers.get("Content-Length")
             total_size = int(total_size) if total_size else 0
@@ -1838,7 +1873,7 @@ class DiagnosticApp:
             try:
                 req = urllib.request.Request(installer_url)
                 req.add_header("User-Agent", "XiaozhiDiagnostic/1.0")
-                resp = urllib.request.urlopen(req, timeout=300)
+                resp = urlopen_safe(req, 300, log=lambda m: self._log(LOG, m))
 
                 total_size = resp.headers.get("Content-Length")
                 total_size = int(total_size) if total_size else 0

@@ -798,18 +798,12 @@ class DiagnosticApp:
         self._log(LOG, "===== Phase 1: Download & Extract =====")
         self._item(L, "\u2022", "Phase 1: Checking package...")
 
-        if os.path.exists(zip_path) and not force:
-            self._item(L, "\u2714", f"{XIAOZHI_ZIP_NAME} exists, skipping download")
-            self._log(LOG, f"[INFO] File exists: {zip_path} ({os.path.getsize(zip_path) // (1024*1024)} MB)")
-        else:
-            if force and os.path.exists(zip_path):
-                os.remove(zip_path)
-                self._item(L, "\u2022", "Re-downloading...")
-            self._verdict(V, "Phase 1: Downloading package...", "#3c424e")
-            if not self._do_download(zip_path, L, LOG, V):
-                msg_queue.put(("progress", 0))
-                msg_queue.put(("done",))
-                return
+        if force:
+            self._item(L, "\u2022", "Re-downloading...")
+        if not self._ensure_package(zip_path, L, LOG, V, force):
+            msg_queue.put(("progress", 0))
+            msg_queue.put(("done",))
+            return
 
         # Verify and extract
         self._verdict(V, "Phase 1: Extracting...", "#3c424e")
@@ -1495,6 +1489,75 @@ class DiagnosticApp:
             self._log(LOG, f"  Skipped {len(skipped)} file(s) incompatible with this OS")
         return skipped
 
+    def _remote_size(self, log=None):
+        """Return the package's total size in bytes as reported by the server,
+        or 0 if it can't be determined (e.g. offline). Tries HEAD first, then a
+        1-byte ranged GET (some servers don't answer HEAD)."""
+        import urllib.request
+        try:
+            req = urllib.request.Request(XIAOZHI_ZIP_URL, method="HEAD")
+            req.add_header("User-Agent", "XiaozhiDiagnostic/1.0")
+            resp = urlopen_safe(req, 30, log=log)
+            cl = resp.headers.get("Content-Length")
+            if cl:
+                return int(cl)
+        except Exception:
+            pass
+        try:
+            req = urllib.request.Request(XIAOZHI_ZIP_URL)
+            req.add_header("User-Agent", "XiaozhiDiagnostic/1.0")
+            req.add_header("Range", "bytes=0-0")
+            resp = urlopen_safe(req, 30, log=log)
+            cr = resp.headers.get("Content-Range", "")
+            if "/" in cr:
+                return int(cr.split("/")[-1])
+            cl = resp.headers.get("Content-Length")
+            if cl:
+                return int(cl)
+        except Exception as e:
+            if log:
+                log(f"[WARN] Could not determine remote size: {e}")
+        return 0
+
+    def _ensure_package(self, zip_path, L, LOG, V, force):
+        """Make sure a COMPLETE package zip is on disk, resuming a partial
+        download left over from a previous run instead of restarting from zero.
+        Returns True if a complete-sized file is present (the caller still
+        verifies zip integrity afterwards), False on download failure."""
+        if force and os.path.exists(zip_path):
+            try:
+                os.remove(zip_path)
+            except OSError:
+                pass
+
+        if os.path.exists(zip_path) and not force:
+            local = os.path.getsize(zip_path)
+            remote = self._remote_size(log=lambda m: self._log(LOG, m))
+            if remote and local < remote:
+                self._item(L, "↻",
+                           f"Incomplete download ({local // (1024*1024)} MB / "
+                           f"{remote // (1024*1024)} MB) — resuming...")
+                self._log(LOG, f"[INFO] Resuming partial download: {local}/{remote} bytes")
+                self._verdict(V, "Resuming previous download...", "#3c424e")
+                return self._do_download(zip_path, L, LOG, V)
+            if remote and local > remote:
+                self._item(L, "!", "Cached file larger than expected — re-downloading...")
+                self._log(LOG, f"[WARN] Local {local} > remote {remote}; re-downloading")
+                try:
+                    os.remove(zip_path)
+                except OSError:
+                    pass
+                self._verdict(V, "Re-downloading package...", "#3c424e")
+                return self._do_download(zip_path, L, LOG, V)
+            # Complete, or remote size unknown (offline) -> keep and let the
+            # caller's zip integrity check decide.
+            self._item(L, "✔", f"{XIAOZHI_ZIP_NAME} present ({local // (1024*1024)} MB)")
+            self._log(LOG, f"[INFO] File present: {zip_path} ({local // (1024*1024)} MB)")
+            return True
+
+        self._verdict(V, "Downloading package...", "#3c424e")
+        return self._do_download(zip_path, L, LOG, V)
+
     def _do_download(self, zip_path, L, LOG, V):
         """Download the package robustly: several attempts with HTTP Range
         resume so a connection that drops part-way (or a TLS unclean shutdown)
@@ -1671,24 +1734,15 @@ class DiagnosticApp:
 
         self._log(LOG, f"Target directory: {target_dir}")
 
-        # Check if zip already exists
-        if os.path.exists(zip_path) and not force:
-            self._item(L, "\u2714", f"{XIAOZHI_ZIP_NAME} already exists, skipping download")
-            self._log(LOG, f"[INFO] File exists: {zip_path}")
-            self._log(LOG, f"  Size: {os.path.getsize(zip_path) // (1024*1024)} MB")
-            self._log(LOG, "  Use [Re-download] to force re-download")
-            self._verdict(V, "File exists, verifying zip integrity...", "#3c424e")
-        else:
-            if force:
-                self._item(L, "\u2022", "Force re-download requested")
-                self._log(LOG, "[INFO] Re-downloading...")
-                if os.path.exists(zip_path):
-                    os.remove(zip_path)
-            self._verdict(V, "Downloading Xiaozhi package...", "#3c424e")
-            if not self._do_download(zip_path, L, LOG, V):
-                msg_queue.put(("progress", 0))
-                msg_queue.put(("done",))
-                return
+        # Ensure a complete zip is present (resumes a partial download from a
+        # previous run instead of restarting the ~1 GB transfer from zero).
+        if force:
+            self._item(L, "\u2022", "Force re-download requested")
+            self._log(LOG, "[INFO] Re-downloading...")
+        if not self._ensure_package(zip_path, L, LOG, V, force):
+            msg_queue.put(("progress", 0))
+            msg_queue.put(("done",))
+            return
 
         # Extract - verify zip first
         self._verdict(V, "Verifying and extracting zip file...", "#3c424e")

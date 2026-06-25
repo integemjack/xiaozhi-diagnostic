@@ -48,6 +48,33 @@ IS_MAC = platform.system() == "Darwin"
 IS_WIN = platform.system() == "Windows"
 
 
+def _augment_path():
+    """A GUI app launched from Finder/Dock (or a packaged .app) inherits only
+    the minimal launchd PATH: /usr/bin:/bin:/usr/sbin:/sbin. That omits the
+    Docker CLI, so `docker info` returns "command not found" and the app can
+    NEVER detect that Docker Desktop has started — it launches Docker fine, then
+    waits forever and falsely reports "Docker failed to start". Prepend the
+    common CLI locations so every run_cmd() can find docker / docker compose."""
+    if IS_MAC:
+        extra = [
+            "/usr/local/bin",                                       # Docker Desktop symlink (Intel) + Homebrew
+            "/opt/homebrew/bin",                                    # Homebrew (Apple Silicon)
+            "/Applications/Docker.app/Contents/Resources/bin",      # bundled docker CLI (always present)
+        ]
+    elif IS_WIN:
+        pf = os.environ.get("ProgramFiles", r"C:\Program Files")
+        extra = [os.path.join(pf, "Docker", "Docker", "resources", "bin")]
+    else:
+        extra = ["/usr/local/bin", "/usr/bin"]
+    parts = os.environ.get("PATH", "").split(os.pathsep)
+    new = [p for p in extra if p and os.path.isdir(p) and p not in parts]
+    if new:
+        os.environ["PATH"] = os.pathsep.join(new + parts)
+
+
+_augment_path()
+
+
 def _desktop_dir():
     """Return the local Desktop path under the user's profile.
 
@@ -842,7 +869,7 @@ class DiagnosticApp:
             if started:
                 self._verdict(V, "Phase 2: Waiting for Docker to start...", "#3c424e")
                 docker_ready = False
-                for i in range(60):
+                for i in range(90):  # Wait up to 180 seconds (first boot is slow)
                     if self.cancel:
                         msg_queue.put(("progress", 0)); msg_queue.put(("done",)); return
                     time.sleep(2)
@@ -853,7 +880,7 @@ class DiagnosticApp:
                     self._verdict(V, f"Phase 2: Waiting for Docker... ({(i+1)*2}s)", "#3c424e")
                 if not docker_ready:
                     self._item(L, "\u2718", "Docker failed to start")
-                    self._verdict(V, "Docker failed to start.", "#ce3a3a")
+                    self._verdict(V, "Docker did not become ready. If this is the first launch, finish Docker Desktop's setup (accept the license / grant permission), then click Start again.", "#ce3a3a")
                     msg_queue.put(("progress", 0))
                     msg_queue.put(("done",))
                     return
@@ -1785,7 +1812,7 @@ class DiagnosticApp:
                 self._item(L, "\u2022", "Waiting for Docker to be ready...")
                 self._verdict(V, "Docker Desktop is starting, please wait...", "#3c424e")
                 docker_ready = False
-                for i in range(60):  # Wait up to 60 seconds
+                for i in range(90):  # Wait up to 180 seconds (first boot is slow)
                     if self.cancel:
                         msg_queue.put(("progress", 0))
                         msg_queue.put(("done",))
@@ -1801,9 +1828,9 @@ class DiagnosticApp:
                     self._item(L, "\u2714", "Docker Desktop started successfully")
                     self._log(LOG, "[OK] Docker is now running")
                 else:
-                    self._item(L, "\u2718", "Docker failed to start within 120 seconds")
+                    self._item(L, "\u2718", "Docker failed to start within 180 seconds")
                     self._log(LOG, "[FAIL] Docker did not become ready in time")
-                    self._verdict(V, "Docker failed to start. Please start Docker Desktop manually.", "#ce3a3a")
+                    self._verdict(V, "Docker did not become ready. If this is the first launch, finish Docker Desktop's setup (accept the license / grant permission), then click Start again.", "#ce3a3a")
                     msg_queue.put(("progress", 0))
                     msg_queue.put(("done",))
                     return

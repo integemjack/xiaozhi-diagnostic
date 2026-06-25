@@ -19,6 +19,7 @@ import time
 import platform
 import zipfile
 import shutil
+import shlex
 
 # ==================== Configuration ====================
 def get_script_dir():
@@ -105,6 +106,10 @@ def get_work_dir():
 
 WORK_DIR = get_work_dir()
 LAST_IP_FILE = os.path.join(WORK_DIR, ".last_ip")
+# Marker written when the one-click flow disables the OS firewall because the
+# OTA address was unreachable. Its presence tells "Stop Containers" to turn the
+# firewall back on afterwards. Stores the OTA URL that triggered the change.
+FIREWALL_MARKER = os.path.join(WORK_DIR, ".firewall_disabled")
 
 
 def _migrate_legacy_data():
@@ -665,49 +670,137 @@ class DiagnosticApp:
         self._start_worker(self._worker_stop_containers)
 
     def _worker_stop_containers(self):
-        """Worker thread: stop all xiaozhi Docker containers."""
+        """Worker thread: stop all xiaozhi Docker containers, then restore the
+        OS firewall if the one-click flow had disabled it for OTA access."""
         L, LOG, V = self.deploy_list, self.deploy_log, self.deploy_verdict
         msg_queue.put(("clear", L)); msg_queue.put(("clear", LOG))
         msg_queue.put(("progress", "indeterminate"))
         self._verdict(V, "Stopping Docker containers...", "#3c424e")
         self._log(LOG, "===== Stopping Containers =====")
 
+        stopped_ok = False
         rc, _ = run_cmd("docker info", timeout=10)
         if rc != 0:
-            self._item(L, "\u2718", "Docker is not running")
-            self._verdict(V, "Docker is not running.", "#d69e14")
-            msg_queue.put(("progress", 0))
-            msg_queue.put(("done",))
-            return
-
-        compose_file = self._find_compose_file()
-        if os.path.exists(compose_file):
-            rc_test, _ = run_cmd("docker compose version", timeout=10)
-            if rc_test == 0:
-                down_cmd = f'docker compose -p xiaozhi -f "{compose_file}" down'
-            else:
-                down_cmd = f'docker-compose -p xiaozhi -f "{compose_file}" down'
-
-            self._item(L, "\u2022", "Running docker compose down...")
-            self._log(LOG, f"Running: {down_cmd}")
-            rc, out = run_cmd(down_cmd, timeout=60)
-            if out:
-                for line in out.split("\n")[-10:]:
-                    self._log(LOG, line)
-
-            if rc == 0:
-                self._item(L, "\u2714", "All containers stopped and removed")
-                self._verdict(V, "All containers stopped.", "#22a056")
-            else:
-                self._item(L, "!", "docker compose down had issues")
-                self._log(LOG, f"[WARN] Exit code: {rc}")
-                self._verdict(V, "Containers may not have stopped cleanly.", "#d69e14")
+            self._item(L, "!", "Docker is not running (nothing to stop)")
+            self._log(LOG, "[INFO] Docker not running")
         else:
-            self._item(L, "\u2718", "No docker-compose file found")
-            self._verdict(V, "No compose file found.", "#ce3a3a")
+            compose_file = self._find_compose_file()
+            if os.path.exists(compose_file):
+                rc_test, _ = run_cmd("docker compose version", timeout=10)
+                if rc_test == 0:
+                    down_cmd = f'docker compose -p xiaozhi -f "{compose_file}" down'
+                else:
+                    down_cmd = f'docker-compose -p xiaozhi -f "{compose_file}" down'
+
+                self._item(L, "\u2022", "Running docker compose down...")
+                self._log(LOG, f"Running: {down_cmd}")
+                rc, out = run_cmd(down_cmd, timeout=60)
+                if out:
+                    for line in out.split("\n")[-10:]:
+                        self._log(LOG, line)
+
+                if rc == 0:
+                    self._item(L, "\u2714", "All containers stopped and removed")
+                    self._verdict(V, "All containers stopped.", "#22a056")
+                    stopped_ok = True
+                else:
+                    self._item(L, "!", "docker compose down had issues")
+                    self._log(LOG, f"[WARN] Exit code: {rc}")
+                    self._verdict(V, "Containers may not have stopped cleanly.", "#d69e14")
+            else:
+                self._item(L, "\u2718", "No docker-compose file found")
+                self._verdict(V, "No compose file found.", "#ce3a3a")
+
+        # Restore the firewall if the one-click flow disabled it for OTA access.
+        self._restore_firewall_if_marked(L, LOG, V, stopped_ok)
 
         msg_queue.put(("progress", 0))
         msg_queue.put(("done",))
+
+    # ---------- OTA reachability + firewall control ----------
+    def _ota_reachable(self, url, timeout=8):
+        """True if the OTA URL answers at all. A connection-level failure
+        (timeout / refused / reset) means unreachable \u2014 typically a firewall
+        block; an HTTP error status still counts as reachable (server replied)."""
+        import urllib.request
+        import urllib.error
+        try:
+            req = urllib.request.Request(url)
+            req.add_header("User-Agent", "XiaozhiDiagnostic/1.0")
+            urllib.request.urlopen(req, timeout=timeout, context=make_ssl_context())
+            return True
+        except urllib.error.HTTPError:
+            return True
+        except Exception:
+            return False
+
+    def _firewall_is_on(self):
+        """Best-effort current firewall state: True (on), False (off), or None
+        (unknown). Used so we don't re-enable a firewall the user kept off."""
+        try:
+            if IS_MAC:
+                rc, out = run_cmd(
+                    "/usr/libexec/ApplicationFirewall/socketfilterfw --getglobalstate",
+                    timeout=10)
+                low = (out or "").lower()
+                if "enabled" in low or "state = 1" in low:
+                    return True
+                if "disabled" in low or "state = 0" in low:
+                    return False
+            elif IS_WIN:
+                rc, out = run_cmd("netsh advfirewall show allprofiles state", timeout=10)
+                up = (out or "").upper()
+                if "ON" in up:
+                    return True
+                if "OFF" in up and "ON" not in up:
+                    return False
+        except Exception:
+            pass
+        return None
+
+    def _set_firewall(self, enable, LOG):
+        """Enable/disable the OS firewall. Requires elevation: macOS shows the
+        admin password prompt (osascript), Windows shows UAC (Start-Process
+        -Verb RunAs). Returns True on success."""
+        state = "on" if enable else "off"
+        try:
+            if IS_MAC:
+                inner = f"/usr/libexec/ApplicationFirewall/socketfilterfw --setglobalstate {state}"
+                applescript = f'do shell script "{inner}" with administrator privileges'
+                cmd = "osascript -e " + shlex.quote(applescript)
+                rc, out = run_cmd(cmd, timeout=120)
+            elif IS_WIN:
+                ps = ("Start-Process netsh -Verb RunAs -Wait -WindowStyle Hidden "
+                      f"-ArgumentList 'advfirewall','set','allprofiles','state','{state}'")
+                cmd = f'powershell -NoProfile -Command "{ps}"'
+                rc, out = run_cmd(cmd, timeout=120)
+            else:
+                verb = "enable" if enable else "disable"
+                rc, out = run_cmd(f"pkexec ufw {verb}", timeout=60)
+            ok = (rc == 0)
+            self._log(LOG, f"[{'OK' if ok else 'FAIL'}] Firewall {state}: {(out or '')[:200]}")
+            return ok
+        except Exception as e:
+            self._log(LOG, f"[FAIL] Firewall {state} error: {e}")
+            return False
+
+    def _restore_firewall_if_marked(self, L, LOG, V, stopped_ok):
+        """If the one-click flow disabled the firewall, turn it back on now that
+        Docker is stopped, and clear the marker."""
+        if not os.path.exists(FIREWALL_MARKER):
+            return
+        self._item(L, "\u2022", "Restoring system firewall (was disabled for OTA access)...")
+        self._log(LOG, "[INFO] Firewall marker present; re-enabling firewall")
+        if self._set_firewall(True, LOG):
+            self._item(L, "\u2714", "System firewall re-enabled")
+            if stopped_ok:
+                self._verdict(V, "Containers stopped and firewall restored.", "#22a056")
+        else:
+            self._item(L, "!", "Could not re-enable firewall \u2014 please turn it on manually")
+        try:
+            os.remove(FIREWALL_MARKER)
+        except OSError:
+            pass
 
     def _open_admin_panel(self):
         """Open the admin management panel in browser using the configured server IP."""
@@ -1073,6 +1166,48 @@ class DiagnosticApp:
             rc, out = run_cmd(f"docker ps --format '{fmt}'", timeout=10)
         running = [x.strip().strip("'").strip('"') for x in (out or "").split("\n") if x.strip()]
         all_running = all(c in running for c in CONTAINERS)
+
+        if self.cancel:
+            msg_queue.put(("progress", 0)); msg_queue.put(("done",)); return
+
+        # ===== Phase 6: OTA reachability / firewall =====
+        self._log(LOG, "")
+        self._log(LOG, "===== Phase 6: OTA Reachability =====")
+        self._item(L, "•", "Phase 6: Checking OTA address...")
+        self._verdict(V, "Phase 6: Checking OTA reachability...", "#3c424e")
+        ota_ip = new_ip if lan_ips else "127.0.0.1"
+        ota_url = f"http://{ota_ip}:{WEB_PORT}/xiaozhi/ota/"
+        self._log(LOG, f"Testing OTA: {ota_url}")
+        if self._ota_reachable(ota_url):
+            self._item(L, "✔", f"OTA reachable: {ota_url}")
+            self._log(LOG, "[OK] OTA address is reachable")
+        else:
+            self._item(L, "!", f"OTA NOT reachable: {ota_url}")
+            self._log(LOG, "[WARN] OTA unreachable")
+            fw = self._firewall_is_on()
+            if fw is False:
+                self._item(L, "!", "Firewall already off — issue is not the firewall")
+                self._log(LOG, "[INFO] Firewall already disabled; skipping")
+            else:
+                self._verdict(V, "OTA unreachable — disabling system firewall (needs permission)...", "#d69e14")
+                self._item(L, "•", "Disabling system firewall (approve the prompt)...")
+                if self._set_firewall(False, LOG):
+                    try:
+                        with open(FIREWALL_MARKER, "w") as f:
+                            f.write(ota_url)
+                    except OSError:
+                        pass
+                    self._item(L, "✔", "Firewall disabled (will be restored on [Stop Containers])")
+                    time.sleep(3)
+                    if self._ota_reachable(ota_url):
+                        self._item(L, "✔", "OTA reachable after disabling firewall")
+                        self._log(LOG, "[OK] OTA reachable after firewall off")
+                    else:
+                        self._item(L, "!", "OTA still unreachable (likely a service issue, not firewall)")
+                        self._log(LOG, "[WARN] OTA still unreachable after firewall off")
+                else:
+                    self._item(L, "✘", "Could not disable firewall (permission denied / unsupported)")
+                    self._log(LOG, "[FAIL] Firewall disable failed")
 
         # ===== Done =====
         self._log(LOG, "")

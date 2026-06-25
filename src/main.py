@@ -132,6 +132,8 @@ class DiagnosticApp:
         self.state = {}
         self._build_ui()
         self._poll_queue()
+        # Auto-run memory check on startup
+        self.root.after(100, self._start_env_check)
 
     def _build_ui(self):
         style = ttk.Style()
@@ -145,7 +147,7 @@ class DiagnosticApp:
         self._build_env_tab()
 
         self.tab_deploy = ttk.Frame(self.notebook)
-        self.notebook.add(self.tab_deploy, text="  1. Download & Deploy  ")
+        self.notebook.add(self.tab_deploy, text="  1. Download & Deploy  ", state="disabled")
         self._build_deploy_tab()
 
         self.tab_conn = ttk.Frame(self.notebook)
@@ -231,14 +233,23 @@ class DiagnosticApp:
             used_gb = mem_info["used"] / (1024 ** 3)
             free_gb = mem_info["free"] / (1024 ** 3)
             pct = (mem_info["used"] / mem_info["total"]) * 100 if mem_info["total"] else 0
-            if pct > 90:
+            if free_gb < 4:
                 color = "#ce3a3a"
-            elif pct > 70:
-                color = "#d69e14"
+                mem_text = (f"Memory: {used_gb:.1f} GB / {total_gb:.1f} GB used ({pct:.0f}%)  |  "
+                            f"Free: {free_gb:.1f} GB  ⚠ Insufficient (< 4GB)")
+                # Lock other tabs
+                self.root.after(0, self._lock_tabs)
             else:
-                color = "#22a056"
-            mem_text = (f"Memory: {used_gb:.1f} GB / {total_gb:.1f} GB used ({pct:.0f}%)  |  "
-                        f"Free: {free_gb:.1f} GB")
+                if pct > 90:
+                    color = "#ce3a3a"
+                elif pct > 70:
+                    color = "#d69e14"
+                else:
+                    color = "#22a056"
+                mem_text = (f"Memory: {used_gb:.1f} GB / {total_gb:.1f} GB used ({pct:.0f}%)  |  "
+                            f"Free: {free_gb:.1f} GB")
+                # Unlock other tabs
+                self.root.after(0, self._unlock_tabs)
             self._verdict(self.env_mem_label, mem_text, color)
         else:
             self._verdict(self.env_mem_label, "Failed to get memory info", "#ce3a3a")
@@ -252,6 +263,27 @@ class DiagnosticApp:
 
         msg_queue.put(("progress", 0))
         msg_queue.put(("done",))
+
+    def _lock_tabs(self):
+        """Disable all tabs except Environment when memory is insufficient."""
+        for i in range(1, self.notebook.index("end")):
+            self.notebook.tab(i, state="disabled")
+        messagebox.showwarning(
+            "Insufficient Memory",
+            "Available memory is less than 4 GB!\n\n"
+            "Xiaozhi Server requires at least 4 GB of free memory to run properly.\n"
+            "With insufficient memory, services may fail to start or crash unexpectedly.\n\n"
+            "Please close some applications to free up memory,\n"
+            "then click [Check Memory] again to re-check.\n\n"
+            "Other tabs are disabled until available memory reaches 4 GB."
+        )
+
+    def _unlock_tabs(self):
+        """Enable all tabs when memory is sufficient and switch to Deploy tab."""
+        for i in range(1, self.notebook.index("end")):
+            self.notebook.tab(i, state="normal")
+        # Auto-switch to Download & Deploy tab
+        self.notebook.select(self.tab_deploy)
 
     def _get_system_memory(self):
         """Get system memory usage (cross-platform)."""

@@ -805,51 +805,10 @@ class DiagnosticApp:
             msg_queue.put(("done",))
             return
 
-        # Verify and extract
+        # Verify and extract (only re-extracts when the package is new/changed,
+        # so user-edited config and runtime data are not clobbered every run).
         self._verdict(V, "Phase 1: Extracting...", "#3c424e")
-        try:
-            with zipfile.ZipFile(zip_path, 'r') as zf:
-                bad_file = zf.testzip()
-                if bad_file:
-                    raise zipfile.BadZipFile(f"Corrupt file: {bad_file}")
-                self._safe_extract(zf, target_dir, LOG)
-            self._item(L, "\u2714", "Package extracted")
-            self._log(LOG, "[OK] Extraction complete")
-
-            if IS_MAC:
-                for root_dir, dirs, files in os.walk(target_dir):
-                    for fname in files:
-                        if fname.endswith(('.sh', '.command', '.py')):
-                            try:
-                                os.chmod(os.path.join(root_dir, fname), 0o755)
-                            except OSError:
-                                pass
-                self._log(LOG, "[OK] macOS permissions fixed")
-
-        except zipfile.BadZipFile as e:
-            self._item(L, "!", f"Zip corrupt, re-downloading...")
-            self._log(LOG, f"[WARN] {str(e)}, re-downloading...")
-            try:
-                os.remove(zip_path)
-            except OSError:
-                pass
-            if not self._do_download(zip_path, L, LOG, V):
-                msg_queue.put(("progress", 0))
-                msg_queue.put(("done",))
-                return
-            try:
-                with zipfile.ZipFile(zip_path, 'r') as zf:
-                    self._safe_extract(zf, target_dir, LOG)
-                self._item(L, "\u2714", "Re-download and extract OK")
-            except Exception as e2:
-                self._item(L, "\u2718", f"Extract failed: {str(e2)}")
-                self._verdict(V, f"Extract failed: {str(e2)}", "#ce3a3a")
-                msg_queue.put(("progress", 0))
-                msg_queue.put(("done",))
-                return
-        except Exception as e:
-            self._item(L, "\u2718", f"Extract error: {str(e)}")
-            self._verdict(V, f"Extract error: {str(e)}", "#ce3a3a")
+        if not self._extract_package(zip_path, target_dir, L, LOG, V, force=force):
             msg_queue.put(("progress", 0))
             msg_queue.put(("done",))
             return
@@ -1489,6 +1448,109 @@ class DiagnosticApp:
             self._log(LOG, f"  Skipped {len(skipped)} file(s) incompatible with this OS")
         return skipped
 
+    def _fix_mac_perms(self, target_dir, LOG):
+        """Make shell scripts / executables runnable after extraction (macOS)."""
+        if not IS_MAC:
+            return
+        self._log(LOG, "Setting executable permissions for scripts...")
+        for root_dir, dirs, files in os.walk(target_dir):
+            for fname in files:
+                fpath = os.path.join(root_dir, fname)
+                if fname.endswith(('.sh', '.command', '.py')) or not os.path.splitext(fname)[1]:
+                    try:
+                        with open(fpath, 'rb') as bf:
+                            header = bf.read(4)
+                        if header.startswith(b'#!') or fname.endswith(('.sh', '.command')):
+                            os.chmod(fpath, 0o755)
+                    except (IOError, OSError):
+                        pass
+        for pattern in ['*.command', '*.sh']:
+            run_cmd(f'find "{target_dir}" -name "{pattern}" -exec chmod +x {{}} \\;', timeout=10)
+
+    def _extract_package(self, zip_path, target_dir, L, LOG, V, force=False):
+        """Extract the package, but only when needed.
+
+        We record the size of the last successfully-extracted zip in a
+        `.extracted` marker. If the same package is already extracted (and the
+        compose file is present), we SKIP extraction — this avoids re-unpacking
+        ~1 GB on every run and, importantly, avoids overwriting config files the
+        user may have edited. A new/forced download (different size) re-extracts.
+        Runtime data (DB, uploads) and DB-stored settings like the server IP are
+        never in the zip, so they are unaffected either way. Returns True on
+        success."""
+        marker = os.path.join(target_dir, ".extracted")
+        try:
+            zsize = os.path.getsize(zip_path)
+        except OSError:
+            zsize = 0
+        compose_ok = os.path.exists(self._find_compose_file())
+
+        if not force:
+            try:
+                with open(marker) as f:
+                    done = f.read().strip()
+            except (OSError, IOError):
+                done = ""
+            if done and done == str(zsize) and compose_ok:
+                self._item(L, "✔", "Package already extracted, skipping (no overwrite)")
+                self._log(LOG, "[INFO] Same package already extracted; keeping existing files.")
+                return True
+
+        self._verdict(V, "Verifying and extracting package...", "#3c424e")
+        self._log(LOG, "Verifying zip integrity...")
+        try:
+            with zipfile.ZipFile(zip_path, 'r') as zf:
+                bad_file = zf.testzip()
+                if bad_file:
+                    raise zipfile.BadZipFile(f"Corrupt file in archive: {bad_file}")
+                self._item(L, "✔", "Zip integrity OK")
+                self._verdict(V, "Extracting files...", "#3c424e")
+                self._log(LOG, "Extracting...")
+                self._safe_extract(zf, target_dir, LOG)
+            self._fix_mac_perms(target_dir, LOG)
+            try:
+                with open(marker, "w") as f:
+                    f.write(str(zsize))
+            except OSError:
+                pass
+            self._item(L, "✔", "Extraction complete")
+            self._log(LOG, f"[OK] Files extracted to: {target_dir}")
+            return True
+
+        except zipfile.BadZipFile as e:
+            self._item(L, "!", "Zip corrupt, re-downloading...")
+            self._log(LOG, f"[WARN] {str(e)}; deleting and re-downloading")
+            for p in (zip_path, marker):
+                try:
+                    os.remove(p)
+                except OSError:
+                    pass
+            if not self._do_download(zip_path, L, LOG, V):
+                return False
+            try:
+                with zipfile.ZipFile(zip_path, 'r') as zf:
+                    bad_file = zf.testzip()
+                    if bad_file:
+                        raise zipfile.BadZipFile(f"Corrupt file in archive: {bad_file}")
+                    self._safe_extract(zf, target_dir, LOG)
+                self._fix_mac_perms(target_dir, LOG)
+                with open(marker, "w") as f:
+                    f.write(str(os.path.getsize(zip_path)))
+                self._item(L, "✔", "Re-download and extraction OK")
+                return True
+            except Exception as e2:
+                self._item(L, "✘", f"Extract failed after re-download: {str(e2)}")
+                self._verdict(V, f"Extract failed: {str(e2)}", "#ce3a3a")
+                return False
+        except PermissionError as e:
+            self._item(L, "✘", f"Permission denied: {str(e)}")
+            self._verdict(V, "Extract failed: permission denied", "#ce3a3a")
+            return False
+        except Exception as e:
+            self._item(L, "✘", f"Extract error: {str(e)}")
+            self._verdict(V, f"Extract error: {str(e)}", "#ce3a3a")
+            return False
+
     def _remote_size(self, log=None):
         """Return the package's total size in bytes as reported by the server,
         or 0 if it can't be determined (e.g. offline). Tries HEAD first, then a
@@ -1744,102 +1806,20 @@ class DiagnosticApp:
             msg_queue.put(("done",))
             return
 
-        # Extract - verify zip first
-        self._verdict(V, "Verifying and extracting zip file...", "#3c424e")
-        self._log(LOG, "Verifying zip integrity...")
-        try:
-            with zipfile.ZipFile(zip_path, 'r') as zf:
-                bad_file = zf.testzip()
-                if bad_file:
-                    raise zipfile.BadZipFile(f"Corrupt file in archive: {bad_file}")
-                self._item(L, "\u2714", "Zip file integrity OK")
-                self._log(LOG, "[OK] Zip file is valid")
+        # Verify and extract (only re-extracts when the package is new/changed,
+        # so user-edited config and runtime data are not clobbered every run).
+        if not self._extract_package(zip_path, target_dir, L, LOG, V, force=force):
+            msg_queue.put(("progress", 0))
+            msg_queue.put(("done",))
+            return
 
-                # Extract
-                self._verdict(V, "Extracting files...", "#3c424e")
-                self._log(LOG, "Extracting...")
-                self._safe_extract(zf, target_dir, LOG)
-
-            self._item(L, "\u2714", "Extraction complete")
-            self._log(LOG, f"Files extracted to: {target_dir}")
-
-            # macOS: fix permissions for shell scripts and executables
-            if IS_MAC:
-                self._item(L, "\u2022", "Fixing file permissions (macOS)...")
-                self._log(LOG, "Setting executable permissions for scripts...")
-                for root_dir, dirs, files in os.walk(target_dir):
-                    for fname in files:
-                        fpath = os.path.join(root_dir, fname)
-                        if fname.endswith(('.sh', '.command', '.py')) or not os.path.splitext(fname)[1]:
-                            try:
-                                with open(fpath, 'rb') as bf:
-                                    header = bf.read(4)
-                                if header.startswith(b'#!') or fname.endswith(('.sh', '.command')):
-                                    os.chmod(fpath, 0o755)
-                            except (IOError, OSError):
-                                pass
-                for pattern in ['*.command', '*.sh']:
-                    run_cmd(f'find "{target_dir}" -name "{pattern}" -exec chmod +x {{}} \\;', timeout=10)
-                self._item(L, "\u2714", "Permissions fixed")
-
-            self._item(L, "\u2714", "Ready to start Docker services")
-            self._verdict(V,
-                          "Download & extract complete! Click [Start Docker Services] to deploy.",
-                          "#22a056")
-
-            # Enable docker start button, change download button to re-download
-            self.root.after(0, lambda: self.btn_docker_start.config(state="normal"))
-            self.root.after(0, lambda: self.btn_download.config(text="Re-download", command=self._start_redownload))
-
-        except zipfile.BadZipFile as e:
-            self._item(L, "\u2718", f"Zip file is corrupt: {str(e)}")
-            self._log(LOG, f"[FAIL] Bad zip file: {str(e)}")
-            self._log(LOG, "  Deleting corrupt file and re-downloading...")
-            self._verdict(V, "Zip file corrupt, re-downloading...", "#d69e14")
-
-            # Delete bad file and re-download
-            try:
-                os.remove(zip_path)
-            except OSError:
-                pass
-
-            if not self._do_download(zip_path, L, LOG, V):
-                msg_queue.put(("progress", 0))
-                msg_queue.put(("done",))
-                return
-
-            # Try extract again
-            try:
-                with zipfile.ZipFile(zip_path, 'r') as zf:
-                    self._safe_extract(zf, target_dir, LOG)
-                self._item(L, "\u2714", "Re-download and extraction successful")
-
-                if IS_MAC:
-                    for root_dir, dirs, files in os.walk(target_dir):
-                        for fname in files:
-                            fpath = os.path.join(root_dir, fname)
-                            if fname.endswith(('.sh', '.command', '.py')):
-                                try:
-                                    os.chmod(fpath, 0o755)
-                                except OSError:
-                                    pass
-                    for pattern in ['*.command', '*.sh']:
-                        run_cmd(f'find "{target_dir}" -name "{pattern}" -exec chmod +x {{}} \\;', timeout=10)
-
-                self._verdict(V, "Re-download & extract complete! Click [Start Docker Services] to deploy.", "#22a056")
-                self.root.after(0, lambda: self.btn_docker_start.config(state="normal"))
-                self.root.after(0, lambda: self.btn_download.config(text="Re-download", command=self._start_redownload))
-
-            except Exception as e2:
-                self._item(L, "\u2718", f"Extract still failed: {str(e2)}")
-                self._verdict(V, f"Extract failed after re-download: {str(e2)}", "#ce3a3a")
-
-        except PermissionError as e:
-            self._item(L, "\u2718", f"Permission denied: {str(e)}")
-            self._verdict(V, "Extract failed: permission denied", "#ce3a3a")
-        except Exception as e:
-            self._item(L, "\u2718", f"Extract error: {str(e)}")
-            self._verdict(V, f"Extract error: {str(e)}", "#ce3a3a")
+        self._item(L, "\u2714", "Ready to start Docker services")
+        self._verdict(V,
+                      "Download & extract complete! Click [Start Docker Services] to deploy.",
+                      "#22a056")
+        # Enable docker start button, change download button to re-download
+        self.root.after(0, lambda: self.btn_docker_start.config(state="normal"))
+        self.root.after(0, lambda: self.btn_download.config(text="Re-download", command=self._start_redownload))
 
         msg_queue.put(("progress", 0))
         msg_queue.put(("done",))

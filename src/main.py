@@ -134,6 +134,10 @@ class DiagnosticApp:
         self.notebook = ttk.Notebook(self.root)
         self.notebook.pack(fill="both", expand=True, padx=8, pady=8)
 
+        self.tab_env = ttk.Frame(self.notebook)
+        self.notebook.add(self.tab_env, text="  0. Environment  ")
+        self._build_env_tab()
+
         self.tab_conn = ttk.Frame(self.notebook)
         self.notebook.add(self.tab_conn, text="  1. Connection  ")
         self._build_conn_tab()
@@ -145,6 +149,300 @@ class DiagnosticApp:
         self.tab_dev = ttk.Frame(self.notebook)
         self.notebook.add(self.tab_dev, text="  3. Devices  ")
         self._build_dev_tab()
+
+    def _build_env_tab(self):
+        """Build the Environment tab with memory usage and process management."""
+        bar = ttk.Frame(self.tab_env)
+        bar.pack(fill="x", padx=8, pady=6)
+        self.btn_env_check = ttk.Button(bar, text="Check Memory",
+                                        command=self._start_env_check)
+        self.btn_env_check.pack(side="left", padx=4)
+        self.btn_kill_proc = ttk.Button(bar, text="Kill Selected Process",
+                                        command=self._kill_selected_process)
+        self.btn_kill_proc.pack(side="left", padx=4)
+        self.btn_env_refresh = ttk.Button(bar, text="Refresh Process List",
+                                          command=self._start_env_check)
+        self.btn_env_refresh.pack(side="left", padx=4)
+
+        # Search bar
+        search_frame = ttk.Frame(self.tab_env)
+        search_frame.pack(fill="x", padx=8, pady=2)
+        ttk.Label(search_frame, text="Filter:").pack(side="left", padx=4)
+        self.env_search_var = tk.StringVar()
+        self.env_search_var.trace_add("write", self._filter_process_list)
+        self.env_search_entry = ttk.Entry(search_frame, textvariable=self.env_search_var, width=30)
+        self.env_search_entry.pack(side="left", padx=4)
+
+        # Memory summary label
+        self.env_mem_label = tk.Label(self.tab_env, text="  Click [Check Memory] to view system memory and process info",
+                                     bg="#3c424e", fg="white", anchor="w",
+                                     font=("Helvetica", 11, "bold"), padx=14, pady=8)
+        self.env_mem_label.pack(fill="x", padx=8, pady=4)
+
+        # Process list treeview
+        proc_frame = ttk.Frame(self.tab_env)
+        proc_frame.pack(fill="both", expand=True, padx=8, pady=4)
+
+        cols = ("PID", "Name", "Memory (MB)", "CPU %", "Status")
+        self.proc_tree = ttk.Treeview(proc_frame, columns=cols, show="headings", height=18)
+        for c in cols:
+            self.proc_tree.heading(c, text=c, command=lambda col=c: self._sort_proc_tree(col))
+            self.proc_tree.column(c, width=120)
+        self.proc_tree.column("PID", width=70)
+        self.proc_tree.column("Name", width=250)
+        self.proc_tree.column("Memory (MB)", width=120)
+        self.proc_tree.column("CPU %", width=80)
+        self.proc_tree.column("Status", width=100)
+
+        # Scrollbar
+        proc_scroll = ttk.Scrollbar(proc_frame, orient="vertical", command=self.proc_tree.yview)
+        self.proc_tree.configure(yscrollcommand=proc_scroll.set)
+        self.proc_tree.pack(side="left", fill="both", expand=True)
+        proc_scroll.pack(side="right", fill="y")
+
+        # Store process data for filtering/sorting
+        self._proc_data = []
+        self._proc_sort_col = "Memory (MB)"
+        self._proc_sort_reverse = True
+
+    def _start_env_check(self):
+        """Start environment check in a background thread."""
+        self._start_worker(self._worker_env)
+
+    def _worker_env(self):
+        """Worker thread: collect memory and process information."""
+        msg_queue.put(("progress", "indeterminate"))
+        self._verdict(self.env_mem_label, "Collecting system information...", "#3c424e")
+
+        # Get system memory info
+        mem_info = self._get_system_memory()
+        if mem_info:
+            total_gb = mem_info["total"] / (1024 ** 3)
+            used_gb = mem_info["used"] / (1024 ** 3)
+            free_gb = mem_info["free"] / (1024 ** 3)
+            pct = (mem_info["used"] / mem_info["total"]) * 100 if mem_info["total"] else 0
+            if pct > 90:
+                color = "#ce3a3a"
+            elif pct > 70:
+                color = "#d69e14"
+            else:
+                color = "#22a056"
+            mem_text = (f"Memory: {used_gb:.1f} GB / {total_gb:.1f} GB used ({pct:.0f}%)  |  "
+                        f"Free: {free_gb:.1f} GB")
+            self._verdict(self.env_mem_label, mem_text, color)
+        else:
+            self._verdict(self.env_mem_label, "Failed to get memory info", "#ce3a3a")
+
+        # Get process list
+        proc_list = self._get_process_list()
+        self._proc_data = proc_list
+
+        # Update tree on main thread
+        self.root.after(0, self._populate_proc_tree)
+
+        msg_queue.put(("progress", 0))
+        msg_queue.put(("done",))
+
+    def _get_system_memory(self):
+        """Get system memory usage (cross-platform)."""
+        try:
+            if IS_WIN:
+                rc, out = run_cmd(
+                    'powershell -Command "Get-CimInstance Win32_OperatingSystem | Select-Object TotalVisibleMemorySize,FreePhysicalMemory | Format-List"',
+                    timeout=15
+                )
+                total = free = 0
+                for line in out.split("\n"):
+                    line = line.strip()
+                    if "TotalVisibleMemorySize" in line and ":" in line:
+                        val = line.split(":")[-1].strip()
+                        if val.isdigit():
+                            total = int(val) * 1024  # KB to bytes
+                    elif "FreePhysicalMemory" in line and ":" in line:
+                        val = line.split(":")[-1].strip()
+                        if val.isdigit():
+                            free = int(val) * 1024
+                if total:
+                    return {"total": total, "used": total - free, "free": free}
+            else:
+                # macOS / Linux
+                if IS_MAC:
+                    rc, out = run_cmd("sysctl -n hw.memsize", timeout=5)
+                    total = int(out.strip()) if rc == 0 and out.strip() else 0
+                    rc2, vm_out = run_cmd("vm_stat", timeout=5)
+                    free = 0
+                    if rc2 == 0:
+                        page_size = 4096
+                        for m in re.finditer(r"Pages free:\s+(\d+)", vm_out):
+                            free += int(m.group(1)) * page_size
+                        for m in re.finditer(r"Pages inactive:\s+(\d+)", vm_out):
+                            free += int(m.group(1)) * page_size
+                    if total:
+                        return {"total": total, "used": total - free, "free": free}
+                else:
+                    rc, out = run_cmd("cat /proc/meminfo", timeout=5)
+                    total = free = available = 0
+                    for line in out.split("\n"):
+                        if line.startswith("MemTotal:"):
+                            total = int(re.search(r"\d+", line).group()) * 1024
+                        elif line.startswith("MemAvailable:"):
+                            available = int(re.search(r"\d+", line).group()) * 1024
+                    if total:
+                        return {"total": total, "used": total - available, "free": available}
+        except Exception:
+            pass
+        return None
+
+    def _get_process_list(self):
+        """Get list of all processes with memory usage (cross-platform)."""
+        processes = []
+        try:
+            if IS_WIN:
+                # Use tasklist for process info
+                rc, out = run_cmd(
+                    'tasklist /FO CSV /NH',
+                    timeout=15
+                )
+                if rc == 0 and out:
+                    for line in out.strip().split("\n"):
+                        line = line.strip()
+                        if not line:
+                            continue
+                        # Parse CSV: "name","pid","session","session#","mem"
+                        parts = line.split('","')
+                        if len(parts) >= 5:
+                            name = parts[0].strip('"')
+                            try:
+                                pid = int(parts[1].strip('"'))
+                            except ValueError:
+                                continue
+                            # Memory is like "12,345 K"
+                            mem_str = parts[4].strip('"').replace(",", "").replace(" K", "").replace(" k", "")
+                            try:
+                                mem_kb = int(mem_str)
+                                mem_mb = mem_kb / 1024.0
+                            except ValueError:
+                                mem_mb = 0.0
+                            processes.append({
+                                "pid": pid,
+                                "name": name,
+                                "mem_mb": round(mem_mb, 1),
+                                "cpu": "-",
+                                "status": "Running"
+                            })
+            else:
+                # macOS / Linux: use ps
+                rc, out = run_cmd("ps aux --sort=-%mem", timeout=15)
+                if rc != 0:
+                    rc, out = run_cmd("ps aux", timeout=15)
+                if rc == 0 and out:
+                    lines = out.strip().split("\n")
+                    for line in lines[1:]:  # Skip header
+                        parts = line.split(None, 10)
+                        if len(parts) >= 11:
+                            try:
+                                pid = int(parts[1])
+                                cpu = parts[2]
+                                mem_pct = parts[3]
+                                # VSZ is in KB (column 4)
+                                rss_kb = int(parts[5])
+                                mem_mb = rss_kb / 1024.0
+                                status = parts[7]
+                                name = parts[10]
+                            except (ValueError, IndexError):
+                                continue
+                            processes.append({
+                                "pid": pid,
+                                "name": name[:60],
+                                "mem_mb": round(mem_mb, 1),
+                                "cpu": cpu,
+                                "status": status
+                            })
+        except Exception:
+            pass
+
+        # Sort by memory descending
+        processes.sort(key=lambda x: x["mem_mb"], reverse=True)
+        return processes
+
+    def _populate_proc_tree(self):
+        """Populate the process treeview with current data (applies filter)."""
+        for item in self.proc_tree.get_children():
+            self.proc_tree.delete(item)
+
+        filter_text = self.env_search_var.get().lower()
+        for proc in self._proc_data:
+            if filter_text and filter_text not in proc["name"].lower() and filter_text not in str(proc["pid"]):
+                continue
+            self.proc_tree.insert("", "end", values=(
+                proc["pid"],
+                proc["name"],
+                f"{proc['mem_mb']:.1f}",
+                proc["cpu"],
+                proc["status"]
+            ))
+
+    def _filter_process_list(self, *args):
+        """Re-filter process list when search text changes."""
+        self._populate_proc_tree()
+
+    def _sort_proc_tree(self, col):
+        """Sort the process tree by the clicked column."""
+        if self._proc_sort_col == col:
+            self._proc_sort_reverse = not self._proc_sort_reverse
+        else:
+            self._proc_sort_col = col
+            self._proc_sort_reverse = True
+
+        key_map = {
+            "PID": lambda x: x["pid"],
+            "Name": lambda x: x["name"].lower(),
+            "Memory (MB)": lambda x: x["mem_mb"],
+            "CPU %": lambda x: float(x["cpu"]) if x["cpu"] != "-" else 0,
+            "Status": lambda x: x["status"],
+        }
+        key_fn = key_map.get(col, lambda x: x["name"].lower())
+        try:
+            self._proc_data.sort(key=key_fn, reverse=self._proc_sort_reverse)
+        except (ValueError, TypeError):
+            pass
+        self._populate_proc_tree()
+
+    def _kill_selected_process(self):
+        """Kill the selected process in the process list."""
+        selected = self.proc_tree.selection()
+        if not selected:
+            messagebox.showwarning("No Selection", "Please select a process to kill.")
+            return
+
+        item = self.proc_tree.item(selected[0])
+        values = item["values"]
+        pid = values[0]
+        name = values[1]
+
+        confirm = messagebox.askyesno(
+            "Confirm Kill Process",
+            f"Are you sure you want to kill the process?\n\n"
+            f"PID: {pid}\nName: {name}\n\n"
+            f"Warning: Killing system processes may cause instability."
+        )
+        if not confirm:
+            return
+
+        try:
+            if IS_WIN:
+                rc, out = run_cmd(f"taskkill /PID {pid} /F", timeout=10)
+            else:
+                rc, out = run_cmd(f"kill -9 {pid}", timeout=10)
+
+            if rc == 0:
+                messagebox.showinfo("Success", f"Process {name} (PID: {pid}) has been terminated.")
+                # Refresh the list
+                self._start_env_check()
+            else:
+                messagebox.showerror("Failed", f"Failed to kill process {name} (PID: {pid}).\n\n{out}")
+        except Exception as e:
+            messagebox.showerror("Error", f"Error killing process: {str(e)}")
 
     def _build_conn_tab(self):
         bar = ttk.Frame(self.tab_conn)

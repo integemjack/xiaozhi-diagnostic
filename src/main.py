@@ -250,8 +250,8 @@ class DiagnosticApp:
         self.state = {}
         self._build_ui()
         self._poll_queue()
-        # Auto-run memory check on startup
-        self.root.after(100, self._start_env_check)
+        # Auto-run memory check on startup (this one may jump to Deploy)
+        self.root.after(100, lambda: self._start_env_check(switch_on_ok=True))
 
     def _build_ui(self):
         style = ttk.Style()
@@ -335,8 +335,13 @@ class DiagnosticApp:
         self._proc_sort_col = "Memory (MB)"
         self._proc_sort_reverse = True
 
-    def _start_env_check(self):
-        """Start environment check in a background thread."""
+    def _start_env_check(self, switch_on_ok=False):
+        """Start environment check in a background thread.
+
+        switch_on_ok only auto-jumps to the Deploy tab on the initial startup
+        check (to guide the user forward). Manual clicks on [Check Memory] /
+        [Refresh Process List] must stay on the Environment tab."""
+        self._env_switch_on_ok = switch_on_ok
         self._start_worker(self._worker_env)
 
     def _worker_env(self):
@@ -397,11 +402,12 @@ class DiagnosticApp:
         )
 
     def _unlock_tabs(self):
-        """Enable all tabs when memory is sufficient and switch to Deploy tab."""
+        """Enable all tabs when memory is sufficient. Only auto-switch to the
+        Deploy tab on the startup check, never on a manual re-check."""
         for i in range(1, self.notebook.index("end")):
             self.notebook.tab(i, state="normal")
-        # Auto-switch to Download & Deploy tab
-        self.notebook.select(self.tab_deploy)
+        if getattr(self, "_env_switch_on_ok", False):
+            self.notebook.select(self.tab_deploy)
 
     def _get_system_memory(self):
         """Get system memory usage (cross-platform)."""
@@ -430,15 +436,28 @@ class DiagnosticApp:
                     rc, out = run_cmd("sysctl -n hw.memsize", timeout=5)
                     total = int(out.strip()) if rc == 0 and out.strip() else 0
                     rc2, vm_out = run_cmd("vm_stat", timeout=5)
-                    free = 0
-                    if rc2 == 0:
-                        page_size = 4096
-                        for m in re.finditer(r"Pages free:\s+(\d+)", vm_out):
-                            free += int(m.group(1)) * page_size
-                        for m in re.finditer(r"Pages inactive:\s+(\d+)", vm_out):
-                            free += int(m.group(1)) * page_size
+                    used = 0
+                    if rc2 == 0 and total:
+                        # CRITICAL: page size is 16 KB on Apple Silicon, 4 KB on
+                        # Intel. Read it from vm_stat instead of hardcoding 4096
+                        # (which undercounted memory 4x on Apple Silicon).
+                        m = re.search(r"page size of (\d+) bytes", vm_out)
+                        page_size = int(m.group(1)) if m else 4096
+
+                        def _pages(name):
+                            mm = re.search(name + r":\s+(\d+)", vm_out)
+                            return int(mm.group(1)) if mm else 0
+
+                        # "Memory Used" the way Activity Monitor reports it:
+                        # active + wired + compressor. Everything else (free,
+                        # inactive, speculative, purgeable, file cache) is
+                        # reclaimable and counts as available.
+                        used = (_pages(r"Pages active")
+                                + _pages(r"Pages wired down")
+                                + _pages(r"Pages occupied by compressor")) * page_size
                     if total:
-                        return {"total": total, "used": total - free, "free": free}
+                        free = max(0, total - used)
+                        return {"total": total, "used": used, "free": free}
                 else:
                     rc, out = run_cmd("cat /proc/meminfo", timeout=5)
                     total = free = available = 0

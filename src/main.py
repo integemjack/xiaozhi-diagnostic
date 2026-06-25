@@ -4,6 +4,8 @@
 Xiaozhi Diagnostic Center
 Cross-platform GUI tool for diagnosing Xiaozhi device connection issues.
 """
+
+VERSION = "1.0.0"
 import tkinter as tk
 from tkinter import ttk, messagebox, scrolledtext
 import threading
@@ -122,7 +124,7 @@ def docker_exec_sql(sql):
 class DiagnosticApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("Xiaozhi Diagnostic Center")
+        self.root.title(f"Xiaozhi Diagnostic Center v{VERSION}")
         self.root.geometry("1000x700")
         self.root.minsize(860, 620)
         self.running = False

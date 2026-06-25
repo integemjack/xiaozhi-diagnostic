@@ -14,6 +14,30 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Get version
+        id: version
+        shell: pwsh
+        run: |
+          if ("${{ github.ref }}" -match "refs/tags/v(.+)") {
+            $ver = $Matches[1]
+          } else {
+            $desc = git describe --tags --always 2>$null
+            if ($desc -match "^v?(.+)") { $ver = $Matches[1] } else { $ver = "0.0.0-dev" }
+          }
+          echo "VERSION=$ver" >> $env:GITHUB_OUTPUT
+          echo "Version: $ver"
+
+      - name: Update version in source
+        shell: pwsh
+        run: |
+          $file = "src/main.py"
+          $content = Get-Content $file -Raw
+          $content = $content -replace 'VERSION = ".*?"', ('VERSION = "' + "${{ steps.version.outputs.VERSION }}" + '"')
+          Set-Content $file $content -NoNewline
+          echo "Updated VERSION to ${{ steps.version.outputs.VERSION }}"
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -26,16 +50,43 @@ jobs:
       - name: Build EXE
         run: pyinstaller build.spec --noconfirm
 
+      - name: Package as ZIP
+        shell: pwsh
+        run: |
+          mkdir package
+          copy dist\XiaozhiDiagnostic.exe package\
+          Compress-Archive -Path package\* -DestinationPath XiaozhiDiagnostic-Windows.zip
+
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: XiaozhiDiagnostic-Windows
-          path: dist/XiaozhiDiagnostic.exe
+          path: XiaozhiDiagnostic-Windows.zip
 
   build-macos:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Get version
+        id: version
+        run: |
+          if [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+            VER="${{ github.ref_name }}"
+            VER="${VER#v}"
+          else
+            VER=$(git describe --tags --always 2>/dev/null || echo "0.0.0-dev")
+            VER="${VER#v}"
+          fi
+          echo "VERSION=$VER" >> $GITHUB_OUTPUT
+          echo "Version: $VER"
+
+      - name: Update version in source
+        run: |
+          sed -i '' "s/VERSION = \".*\"/VERSION = \"${{ steps.version.outputs.VERSION }}\"/" src/main.py
+          echo "Updated VERSION to ${{ steps.version.outputs.VERSION }}"
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -45,16 +96,25 @@ jobs:
       - name: Install dependencies
         run: pip install pyinstaller==6.11.1
 
-      - name: Build single executable
+      - name: Build macOS app
         run: |
-          pyinstaller --onefile --windowed --name XiaozhiDiagnostic-macOS src/main.py --noconfirm
-          chmod +x dist/XiaozhiDiagnostic-macOS
+          pyinstaller --onefile --windowed --name XiaozhiDiagnostic src/main.py --noconfirm
+          chmod +x dist/XiaozhiDiagnostic
+
+      - name: Create DMG
+        run: |
+          mkdir -p dmg_content
+          cp dist/XiaozhiDiagnostic dmg_content/
+          hdiutil create -volname "XiaozhiDiagnostic" \
+            -srcfolder dmg_content \
+            -ov -format UDZO \
+            XiaozhiDiagnostic-macOS.dmg
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: XiaozhiDiagnostic-macOS
-          path: dist/XiaozhiDiagnostic-macOS
+          path: XiaozhiDiagnostic-macOS.dmg
 
   release:
     needs: [build-windows, build-macos]
@@ -77,6 +137,6 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            artifacts/XiaozhiDiagnostic.exe
-            artifacts/XiaozhiDiagnostic-macOS
+            artifacts/XiaozhiDiagnostic-Windows.zip
+            artifacts/XiaozhiDiagnostic-macOS.dmg
           generate_release_notes: true

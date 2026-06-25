@@ -806,28 +806,20 @@ class DiagnosticApp:
         """Open the admin management panel in browser using the configured server IP."""
         import webbrowser
 
-        # Try to get the current server IP
+        # Source of truth: the database. Then fall back to this machine's LAN IP,
+        # then localhost. (.last_ip is no longer used for IP determination.)
         server_ip = None
+        try:
+            server_ip = self._get_current_ip_from_db()
+        except Exception:
+            pass
 
-        # First try from .last_ip file
-        last_ip_path = LAST_IP_FILE
-        if os.path.exists(last_ip_path):
-            try:
-                with open(last_ip_path) as f:
-                    ip = f.read().strip()
-                if re.match(r"\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}", ip):
-                    server_ip = ip
-            except Exception:
-                pass
-
-        # Fallback: try from database
         if not server_ip:
-            try:
-                server_ip = self._get_current_ip_from_db()
-            except Exception:
-                pass
+            lan_ips = get_lan_ips()
+            server_ip = next((ip for ip in lan_ips if ip.startswith("192.168.")), None)
+            if not server_ip and lan_ips:
+                server_ip = lan_ips[0]
 
-        # Fallback: use localhost
         if not server_ip:
             server_ip = "localhost"
 
@@ -837,11 +829,25 @@ class DiagnosticApp:
     def _start_one_click(self):
         """One-click: download + docker start + change IP."""
         self._force_redownload = False
+        self._wipe_all = False
         self._start_worker(self._worker_one_click)
 
     def _start_redownload(self):
-        """Force re-download then full start."""
+        """Re-download = full project re-initialization. Confirm first, because
+        this deletes EVERYTHING (package, database, uploads, saved settings)."""
+        if not messagebox.askyesno(
+                "Re-initialize entire project?",
+                "Re-download will DELETE ALL project files and re-initialize the "
+                "entire project from scratch:\n\n"
+                "  • the downloaded package (will be downloaded again, ~1 GB)\n"
+                "  • the database and ALL its data\n"
+                "  • uploaded files\n"
+                "  • saved settings, including the server IP (.last_ip)\n\n"
+                "Running containers will be stopped first. This CANNOT be undone.\n\n"
+                "Continue?"):
+            return
         self._force_redownload = True
+        self._wipe_all = True
         self._start_worker(self._worker_one_click)
 
     def _worker_one_click(self):
@@ -885,6 +891,14 @@ class DiagnosticApp:
                     self._log(LOG, "[INFO] No compose file found, skipping stop")
             else:
                 self._log(LOG, "[INFO] Docker not running, nothing to stop")
+            self._log(LOG, "")
+
+        # Full project re-initialization requested via [Re-download]: wipe
+        # everything (package, DB data, uploads, .last_ip, markers) first.
+        if getattr(self, '_wipe_all', False):
+            self._log(LOG, "===== Re-initializing project (deleting all files) =====")
+            self._wipe_work_dir(L, LOG)
+            self._wipe_all = False
             self._log(LOG, "")
 
         # ===== Phase 1: Download & Extract =====
@@ -1000,10 +1014,20 @@ class DiagnosticApp:
 
         if rc != 0:
             self._item(L, "\u2718", "docker compose up failed")
-            self._verdict(V, "Docker compose up failed.", "#ce3a3a")
-            msg_queue.put(("progress", 0))
-            msg_queue.put(("done",))
-            return
+            self._log(LOG, "[FAIL] docker compose up failed")
+            # Offer to re-extract/reinstall the package (files may be missing/bad)
+            if self._prompt_reextract(L, LOG, V, target_dir, zip_path):
+                self._item(L, "\u2022", "Retrying docker compose up after re-extract...")
+                self._log(LOG, f"Re-running: {compose_cmd}")
+                rc, out = run_cmd(compose_cmd, timeout=1800)
+                if out:
+                    for line in out.split("\n")[-15:]:
+                        self._log(LOG, line)
+            if rc != 0:
+                self._verdict(V, "Docker compose up failed.", "#ce3a3a")
+                msg_queue.put(("progress", 0))
+                msg_queue.put(("done",))
+                return
 
         self._item(L, "\u2714", "Docker compose up completed")
 
@@ -1170,44 +1194,49 @@ class DiagnosticApp:
         if self.cancel:
             msg_queue.put(("progress", 0)); msg_queue.put(("done",)); return
 
-        # ===== Phase 6: OTA reachability / firewall =====
+        # ===== Phase 6: Firewall (unconditionally disabled for device access) =====
         self._log(LOG, "")
-        self._log(LOG, "===== Phase 6: OTA Reachability =====")
-        self._item(L, "•", "Phase 6: Checking OTA address...")
-        self._verdict(V, "Phase 6: Checking OTA reachability...", "#3c424e")
+        self._log(LOG, "===== Phase 6: Firewall =====")
+        self._item(L, "•", "Phase 6: Disabling system firewall for device access...")
+        self._verdict(V, "Phase 6: Disabling firewall (approve the prompt)...", "#3c424e")
         ota_ip = new_ip if lan_ips else "127.0.0.1"
         ota_url = f"http://{ota_ip}:{WEB_PORT}/xiaozhi/ota/"
-        self._log(LOG, f"Testing OTA: {ota_url}")
-        if self._ota_reachable(ota_url):
-            self._item(L, "✔", f"OTA reachable: {ota_url}")
-            self._log(LOG, "[OK] OTA address is reachable")
+        self._log(LOG, f"OTA address: {ota_url}")
+        fw = self._firewall_is_on()
+        if fw is False:
+            self._item(L, "✔", "System firewall already off")
+            self._log(LOG, "[INFO] Firewall already disabled; nothing to do")
         else:
-            self._item(L, "!", f"OTA NOT reachable: {ota_url}")
-            self._log(LOG, "[WARN] OTA unreachable")
-            fw = self._firewall_is_on()
-            if fw is False:
-                self._item(L, "!", "Firewall already off — issue is not the firewall")
-                self._log(LOG, "[INFO] Firewall already disabled; skipping")
+            if self._set_firewall(False, LOG):
+                try:
+                    with open(FIREWALL_MARKER, "w") as f:
+                        f.write(ota_url)
+                except OSError:
+                    pass
+                self._item(L, "✔", "System firewall disabled (restored on [Stop Containers])")
             else:
-                self._verdict(V, "OTA unreachable — disabling system firewall (needs permission)...", "#d69e14")
-                self._item(L, "•", "Disabling system firewall (approve the prompt)...")
-                if self._set_firewall(False, LOG):
-                    try:
-                        with open(FIREWALL_MARKER, "w") as f:
-                            f.write(ota_url)
-                    except OSError:
-                        pass
-                    self._item(L, "✔", "Firewall disabled (will be restored on [Stop Containers])")
-                    time.sleep(3)
-                    if self._ota_reachable(ota_url):
-                        self._item(L, "✔", "OTA reachable after disabling firewall")
-                        self._log(LOG, "[OK] OTA reachable after firewall off")
-                    else:
-                        self._item(L, "!", "OTA still unreachable (likely a service issue, not firewall)")
-                        self._log(LOG, "[WARN] OTA still unreachable after firewall off")
-                else:
-                    self._item(L, "✘", "Could not disable firewall (permission denied / unsupported)")
-                    self._log(LOG, "[FAIL] Firewall disable failed")
+                self._item(L, "✘", "Could not disable firewall (permission denied / unsupported)")
+                self._log(LOG, "[FAIL] Firewall disable failed")
+
+        if self.cancel:
+            msg_queue.put(("progress", 0)); msg_queue.put(("done",)); return
+
+        # ===== Phase 7: Verify server IP in database =====
+        self._log(LOG, "")
+        self._log(LOG, "===== Phase 7: Verify Server IP =====")
+        self._item(L, "•", "Phase 7: Verifying server IP in database...")
+        self._verdict(V, "Phase 7: Verifying server IP...", "#3c424e")
+        db_ip = self._get_current_ip_from_db()
+        expected_ip = new_ip if lan_ips else None
+        if not db_ip:
+            self._item(L, "!", "Could not read server IP from database")
+            self._log(LOG, "[WARN] No IP configured in database")
+        elif expected_ip and db_ip != expected_ip:
+            self._item(L, "!", f"DB IP {db_ip} != selected {expected_ip}")
+            self._log(LOG, f"[WARN] Database IP ({db_ip}) does not match selected IP ({expected_ip})")
+        else:
+            self._item(L, "✔", f"Server IP in database: {db_ip}")
+            self._log(LOG, f"[OK] Database IP verified: {db_ip}")
 
         # ===== Done =====
         self._log(LOG, "")
@@ -1523,8 +1552,10 @@ class DiagnosticApp:
         msg_queue.put(("done",))
 
     def _get_current_ip_from_db(self):
-        """Read the current server IP from database sys_params."""
-        # Try to get from websocket URL or OTA URL in sys_params
+        """Read the current server IP from the database (the single source of
+        truth). We deliberately do NOT fall back to the .last_ip file: that file
+        is only an informational cache and could drift from what's actually
+        configured in the DB."""
         out = docker_exec_sql(
             "SELECT param_value FROM sys_params WHERE param_code IN ('websocket_url','ota_url') LIMIT 1"
         )
@@ -1533,16 +1564,6 @@ class DiagnosticApp:
             m = re.search(r"(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})", out)
             if m:
                 return m.group(1)
-        # Fallback: read from .last_ip file
-        last_ip_path = LAST_IP_FILE
-        if os.path.exists(last_ip_path):
-            try:
-                with open(last_ip_path) as f:
-                    ip = f.read().strip()
-                if re.match(r"\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}", ip):
-                    return ip
-            except Exception:
-                pass
         return None
 
     def _find_compose_file(self):
@@ -1553,9 +1574,13 @@ class DiagnosticApp:
                 return path
         return "docker-compose_all.yml"
 
-    def _safe_extract(self, zf, target_dir, LOG):
-        """Extract zip contents safely, skipping files that can't be created on this OS."""
+    def _safe_extract(self, zf, target_dir, LOG, overwrite=True):
+        """Extract zip contents safely, skipping files that can't be created on
+        this OS. When overwrite=False, files that already exist on disk with the
+        correct size are left untouched (so user-present/edited files are not
+        clobbered) and only missing/wrong-size files are written."""
         skipped = []
+        kept = 0
         # Files to skip: Unix sockets, device files, or names problematic on Windows
         skip_suffixes = ('.sock', '.socket')
 
@@ -1569,6 +1594,15 @@ class DiagnosticApp:
             # Skip empty entries with no name
             if not member.filename:
                 continue
+            # Preserve existing intact files unless overwriting
+            if not overwrite and not member.is_dir():
+                dest = os.path.join(target_dir, member.filename)
+                try:
+                    if os.path.exists(dest) and os.path.getsize(dest) == member.file_size:
+                        kept += 1
+                        continue
+                except OSError:
+                    pass
             try:
                 zf.extract(member, target_dir)
             except (OSError, IOError) as e:
@@ -1579,9 +1613,44 @@ class DiagnosticApp:
                 skipped.append(f"{member.filename} ({str(e)})")
                 self._log(LOG, f"  [SKIP] {member.filename}: {str(e)}")
 
+        if kept:
+            self._log(LOG, f"  Kept {kept} existing file(s) (not overwritten)")
         if skipped:
             self._log(LOG, f"  Skipped {len(skipped)} file(s) incompatible with this OS")
         return skipped
+
+    def _files_present(self, zip_path, target_dir, check_crc=False):
+        """Verify the package is fully present on disk. Every file in the zip
+        must exist with the recorded size (a fast integrity check that catches
+        missing or truncated files). With check_crc=True it also verifies each
+        file's CRC32 against the value stored in the zip (thorough but slow, as
+        it reads every extracted file). Returns True if all files check out."""
+        try:
+            with zipfile.ZipFile(zip_path, 'r') as zf:
+                for m in zf.infolist():
+                    if m.is_dir() or not m.filename:
+                        continue
+                    if any(m.filename.endswith(s) for s in ('.sock', '.socket')):
+                        continue
+                    dest = os.path.join(target_dir, m.filename)
+                    if not os.path.exists(dest):
+                        return False
+                    if os.path.getsize(dest) != m.file_size:
+                        return False
+                    if check_crc and m.CRC:
+                        crc = 0
+                        with open(dest, 'rb') as fh:
+                            import zlib
+                            while True:
+                                chunk = fh.read(1024 * 1024)
+                                if not chunk:
+                                    break
+                                crc = zlib.crc32(chunk, crc)
+                        if (crc & 0xFFFFFFFF) != m.CRC:
+                            return False
+            return True
+        except Exception:
+            return False
 
     def _fix_mac_perms(self, target_dir, LOG):
         """Make shell scripts / executables runnable after extraction (macOS)."""
@@ -1603,32 +1672,20 @@ class DiagnosticApp:
             run_cmd(f'find "{target_dir}" -name "{pattern}" -exec chmod +x {{}} \\;', timeout=10)
 
     def _extract_package(self, zip_path, target_dir, L, LOG, V, force=False):
-        """Extract the package, but only when needed.
+        """Extract the package only when needed.
 
-        We record the size of the last successfully-extracted zip in a
-        `.extracted` marker. If the same package is already extracted (and the
-        compose file is present), we SKIP extraction — this avoids re-unpacking
-        ~1 GB on every run and, importantly, avoids overwriting config files the
-        user may have edited. A new/forced download (different size) re-extracts.
-        Runtime data (DB, uploads) and DB-stored settings like the server IP are
-        never in the zip, so they are unaffected either way. Returns True on
-        success."""
-        marker = os.path.join(target_dir, ".extracted")
-        try:
-            zsize = os.path.getsize(zip_path)
-        except OSError:
-            zsize = 0
-        compose_ok = os.path.exists(self._find_compose_file())
-
+        If every file is already present on disk (verified by size against the
+        zip) and the compose file exists, extraction is SKIPPED — nothing is
+        overwritten. Otherwise we extract; without force, existing intact files
+        are preserved and only missing ones are written. With force=True
+        (Re-download / reinstall) everything is overwritten. Runtime data (DB,
+        uploads) and DB-stored settings (server IP) are never in the zip.
+        Returns True on success."""
         if not force:
-            try:
-                with open(marker) as f:
-                    done = f.read().strip()
-            except (OSError, IOError):
-                done = ""
-            if done and done == str(zsize) and compose_ok:
-                self._item(L, "✔", "Package already extracted, skipping (no overwrite)")
-                self._log(LOG, "[INFO] Same package already extracted; keeping existing files.")
+            if (os.path.exists(self._find_compose_file())
+                    and self._files_present(zip_path, target_dir)):
+                self._item(L, "✔", "All package files present, skipping extraction (no overwrite)")
+                self._log(LOG, "[INFO] All files present and intact; not overwriting.")
                 return True
 
         self._verdict(V, "Verifying and extracting package...", "#3c424e")
@@ -1640,14 +1697,9 @@ class DiagnosticApp:
                     raise zipfile.BadZipFile(f"Corrupt file in archive: {bad_file}")
                 self._item(L, "✔", "Zip integrity OK")
                 self._verdict(V, "Extracting files...", "#3c424e")
-                self._log(LOG, "Extracting...")
-                self._safe_extract(zf, target_dir, LOG)
+                self._log(LOG, f"Extracting ({'overwrite' if force else 'missing files only'})...")
+                self._safe_extract(zf, target_dir, LOG, overwrite=force)
             self._fix_mac_perms(target_dir, LOG)
-            try:
-                with open(marker, "w") as f:
-                    f.write(str(zsize))
-            except OSError:
-                pass
             self._item(L, "✔", "Extraction complete")
             self._log(LOG, f"[OK] Files extracted to: {target_dir}")
             return True
@@ -1655,11 +1707,10 @@ class DiagnosticApp:
         except zipfile.BadZipFile as e:
             self._item(L, "!", "Zip corrupt, re-downloading...")
             self._log(LOG, f"[WARN] {str(e)}; deleting and re-downloading")
-            for p in (zip_path, marker):
-                try:
-                    os.remove(p)
-                except OSError:
-                    pass
+            try:
+                os.remove(zip_path)
+            except OSError:
+                pass
             if not self._do_download(zip_path, L, LOG, V):
                 return False
             try:
@@ -1667,10 +1718,8 @@ class DiagnosticApp:
                     bad_file = zf.testzip()
                     if bad_file:
                         raise zipfile.BadZipFile(f"Corrupt file in archive: {bad_file}")
-                    self._safe_extract(zf, target_dir, LOG)
+                    self._safe_extract(zf, target_dir, LOG, overwrite=True)
                 self._fix_mac_perms(target_dir, LOG)
-                with open(marker, "w") as f:
-                    f.write(str(os.path.getsize(zip_path)))
                 self._item(L, "✔", "Re-download and extraction OK")
                 return True
             except Exception as e2:
@@ -1685,6 +1734,62 @@ class DiagnosticApp:
             self._item(L, "✘", f"Extract error: {str(e)}")
             self._verdict(V, f"Extract error: {str(e)}", "#ce3a3a")
             return False
+
+    def _prompt_reextract(self, L, LOG, V, target_dir, zip_path):
+        """Ask the user (on the UI thread) whether to re-extract/reinstall the
+        package, e.g. after Docker services fail to start. Returns True if the
+        package was re-extracted."""
+        answer = [None]
+        done = [False]
+
+        def ask():
+            answer[0] = messagebox.askyesno(
+                "Docker failed to start",
+                "Docker services failed to start.\n\n"
+                "This often means the package files are missing or corrupted.\n\n"
+                "Re-extract (reinstall) the package files now and try again?")
+            done[0] = True
+
+        self.root.after(0, ask)
+        while not done[0]:
+            if self.cancel:
+                return False
+            time.sleep(0.1)
+        if not answer[0]:
+            self._log(LOG, "[INFO] User declined re-extract")
+            return False
+        self._item(L, "•", "Re-extracting package (reinstall)...")
+        self._log(LOG, "[INFO] Re-extracting package on user request")
+        return self._extract_package(zip_path, target_dir, L, LOG, V, force=True)
+
+    def _wipe_work_dir(self, L, LOG):
+        """Delete EVERYTHING under WORK_DIR for a full project re-initialization
+        (used by Re-download). Explicitly removes the saved IP (.last_ip) and the
+        firewall marker too."""
+        self._item(L, "•", "Initializing project (deleting all files)...")
+        self._log(LOG, f"[INFO] Wiping {WORK_DIR}")
+        removed = 0
+        try:
+            for name in os.listdir(WORK_DIR):
+                path = os.path.join(WORK_DIR, name)
+                try:
+                    if os.path.isdir(path) and not os.path.islink(path):
+                        shutil.rmtree(path, ignore_errors=True)
+                    else:
+                        os.remove(path)
+                    removed += 1
+                except OSError as e:
+                    self._log(LOG, f"  [WARN] could not delete {name}: {e}")
+        except OSError as e:
+            self._log(LOG, f"[WARN] wipe error: {e}")
+        # Belt and suspenders: ensure saved IP / markers are gone even if listing missed them
+        for p in (LAST_IP_FILE, FIREWALL_MARKER):
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+        self._item(L, "✔", f"Project initialized ({removed} item(s) removed)")
+        self._log(LOG, f"[OK] Removed {removed} item(s) from {WORK_DIR}")
 
     def _remote_size(self, log=None):
         """Return the package's total size in bytes as reported by the server,
@@ -2083,10 +2188,20 @@ class DiagnosticApp:
         if rc != 0:
             self._item(L, "\u2718", "docker compose up failed")
             self._log(LOG, f"[FAIL] Exit code: {rc}")
-            self._verdict(V, "Docker compose up failed. Check logs for details.", "#ce3a3a")
-            msg_queue.put(("progress", 0))
-            msg_queue.put(("done",))
-            return
+            # Offer to re-extract/reinstall the package (files may be missing/bad)
+            zip_path = os.path.join(WORK_DIR, XIAOZHI_ZIP_NAME)
+            if self._prompt_reextract(L, LOG, V, WORK_DIR, zip_path):
+                self._item(L, "\u2022", "Retrying docker compose up after re-extract...")
+                self._log(LOG, f"Re-running: {compose_cmd}")
+                rc, out = run_cmd(compose_cmd, timeout=1800)
+                if out:
+                    for line in out.split("\n")[-20:]:
+                        self._log(LOG, line)
+            if rc != 0:
+                self._verdict(V, "Docker compose up failed. Check logs for details.", "#ce3a3a")
+                msg_queue.put(("progress", 0))
+                msg_queue.put(("done",))
+                return
 
         self._item(L, "\u2714", "Docker compose up completed")
         self._log(LOG, "")
@@ -2829,12 +2944,10 @@ class DiagnosticApp:
             self._item(L, "\u2718", "WebSocket port: NOT reachable")
             self._log(LOG, "[FAIL] WebSocket port not reachable")
 
-        # IP consistency
+        # IP consistency — read the ACTUAL configured IP from the database
+        # (not the .last_ip cache, which can drift).
         if self.cancel: msg_queue.put(("done",)); return
-        db_ip = None
-        if os.path.exists(LAST_IP_FILE):
-            with open(LAST_IP_FILE) as f:
-                db_ip = f.read().strip()
+        db_ip = self._get_current_ip_from_db()
         self.state["DbIp"] = db_ip
         if not lan_ips:
             self._item(L, "\u2718", "IP: no LAN IP")
@@ -2854,7 +2967,7 @@ class DiagnosticApp:
                     f"Devices will get a wrong address.\n\nRun changeIp to fix it."
                 ))
         else:
-            self._item(L, "!", "IP: .last_ip not found")
+            self._item(L, "!", "IP: not configured in database")
             self.state["IpMatch"] = None
 
         self._log(LOG, "===== Server check complete =====")

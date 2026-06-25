@@ -18,6 +18,7 @@ import socket
 import time
 import platform
 import zipfile
+import shutil
 
 # ==================== Configuration ====================
 def get_script_dir():
@@ -26,7 +27,6 @@ def get_script_dir():
     return os.path.dirname(os.path.abspath(sys.argv[0]))
 
 SCRIPT_DIR = get_script_dir()
-LAST_IP_FILE = os.path.join(SCRIPT_DIR, ".last_ip")
 WS_PORT = 8000
 WEB_PORT = 8002
 VISION_PORT = 8003
@@ -46,6 +46,56 @@ XIAOZHI_ZIP_NAME = "xiaozhi_v18.zip"
 
 IS_MAC = platform.system() == "Darwin"
 IS_WIN = platform.system() == "Windows"
+
+
+def _desktop_dir():
+    """Return the local Desktop path under the user's profile.
+
+    On Windows this is the physical %USERPROFILE%\\Desktop (and ~/Desktop on
+    macOS). We deliberately do NOT follow a OneDrive Desktop redirection: the
+    package's MySQL/data folders must stay local, otherwise OneDrive would try
+    to sync gigabytes of database files (slow, and it locks open DB files)."""
+    return os.path.join(os.path.expanduser("~"), "Desktop")
+
+
+# Working directory for the downloaded/extracted package and the Docker Compose
+# project. It must be user-writable AND shared with Docker Desktop. The app's
+# install dir (e.g. /Applications/XiaozhiDiagnostic.app/Contents/MacOS, or
+# C:\Program Files\...) is read-only without admin rights and is NOT in Docker
+# Desktop's default file-sharing list, so the compose file's relative bind
+# mounts (./mysql/data, ./data, ./uploadfile) fail with
+# "path is not shared from the host". The Desktop lives under the user's home
+# directory, which is shared by default, so all runtime data goes into a
+# visible "xiaozhi" folder there.
+def get_work_dir():
+    d = os.path.join(_desktop_dir(), "xiaozhi")
+    try:
+        os.makedirs(d, exist_ok=True)
+    except OSError:
+        d = SCRIPT_DIR  # last-resort fallback
+    return d
+
+
+WORK_DIR = get_work_dir()
+LAST_IP_FILE = os.path.join(WORK_DIR, ".last_ip")
+
+
+def _migrate_legacy_data():
+    """Move a previously downloaded package zip out of the install dir into
+    WORK_DIR so upgrading users don't re-download ~1 GB. Everything else the
+    zip contains is regenerated under WORK_DIR on the next extract."""
+    if WORK_DIR == SCRIPT_DIR:
+        return
+    legacy = os.path.join(SCRIPT_DIR, XIAOZHI_ZIP_NAME)
+    dest = os.path.join(WORK_DIR, XIAOZHI_ZIP_NAME)
+    if os.path.exists(legacy) and not os.path.exists(dest):
+        try:
+            shutil.move(legacy, dest)
+        except (OSError, shutil.Error):
+            pass
+
+
+_migrate_legacy_data()
 
 msg_queue = queue.Queue()
 
@@ -615,7 +665,7 @@ class DiagnosticApp:
         server_ip = None
 
         # First try from .last_ip file
-        last_ip_path = os.path.join(SCRIPT_DIR, ".last_ip")
+        last_ip_path = LAST_IP_FILE
         if os.path.exists(last_ip_path):
             try:
                 with open(last_ip_path) as f:
@@ -658,7 +708,7 @@ class DiagnosticApp:
         self._log(LOG, "========== One-Click Start ==========")
         self._log(LOG, "")
 
-        target_dir = SCRIPT_DIR
+        target_dir = WORK_DIR
         zip_path = os.path.join(target_dir, XIAOZHI_ZIP_NAME)
         force = getattr(self, '_force_redownload', False)
 
@@ -976,7 +1026,7 @@ class DiagnosticApp:
 
                 # Save .last_ip
                 try:
-                    with open(os.path.join(SCRIPT_DIR, ".last_ip"), "w") as f:
+                    with open(LAST_IP_FILE, "w") as f:
                         f.write(new_ip)
                 except Exception:
                     pass
@@ -1283,7 +1333,7 @@ class DiagnosticApp:
         self._log(LOG, "[OK] Redis FLUSHALL")
 
         # Save new IP to .last_ip file
-        last_ip_path = os.path.join(SCRIPT_DIR, ".last_ip")
+        last_ip_path = LAST_IP_FILE
         try:
             with open(last_ip_path, "w") as f:
                 f.write(new_ip)
@@ -1344,7 +1394,7 @@ class DiagnosticApp:
             if m:
                 return m.group(1)
         # Fallback: read from .last_ip file
-        last_ip_path = os.path.join(SCRIPT_DIR, ".last_ip")
+        last_ip_path = LAST_IP_FILE
         if os.path.exists(last_ip_path):
             try:
                 with open(last_ip_path) as f:
@@ -1358,7 +1408,7 @@ class DiagnosticApp:
     def _find_compose_file(self):
         """Find the docker-compose file path."""
         for name in ["docker-compose_all.yml", "docker-compose.yml"]:
-            path = os.path.join(SCRIPT_DIR, name)
+            path = os.path.join(WORK_DIR, name)
             if os.path.exists(path):
                 return path
         return "docker-compose_all.yml"
@@ -1442,7 +1492,7 @@ class DiagnosticApp:
         msg_queue.put(("clear", L)); msg_queue.put(("clear", LOG))
         msg_queue.put(("progress", "indeterminate"))
 
-        target_dir = SCRIPT_DIR
+        target_dir = WORK_DIR
         zip_path = os.path.join(target_dir, XIAOZHI_ZIP_NAME)
         force = getattr(self, '_force_redownload', False)
 
@@ -1642,7 +1692,7 @@ class DiagnosticApp:
         # Step 2: Find docker-compose file
         compose_file = None
         for name in ["docker-compose_all.yml", "docker-compose.yml"]:
-            path = os.path.join(SCRIPT_DIR, name)
+            path = os.path.join(WORK_DIR, name)
             if os.path.exists(path):
                 compose_file = path
                 break
@@ -1868,7 +1918,7 @@ class DiagnosticApp:
             self._verdict(V, "Downloading Docker Desktop installer...", "#3c424e")
 
             installer_url = "https://desktop.docker.com/win/main/amd64/Docker%20Desktop%20Installer.exe"
-            installer_path = os.path.join(SCRIPT_DIR, "DockerDesktopInstaller.exe")
+            installer_path = os.path.join(WORK_DIR, "DockerDesktopInstaller.exe")
 
             try:
                 req = urllib.request.Request(installer_url)

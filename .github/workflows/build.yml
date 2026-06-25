@@ -96,18 +96,22 @@ jobs:
       - name: Install dependencies
         run: pip install pyinstaller==6.11.1
 
-      - name: Build macOS app
+      - name: Build macOS app bundle
         run: |
-          pyinstaller --onefile --windowed --name XiaozhiDiagnostic src/main.py --noconfirm
-          chmod +x dist/XiaozhiDiagnostic
+          pyinstaller --windowed --name XiaozhiDiagnostic \
+            --osx-bundle-identifier com.xiaozhi.diagnostic \
+            src/main.py --noconfirm
+          chmod +x dist/XiaozhiDiagnostic.app/Contents/MacOS/XiaozhiDiagnostic
 
-      - name: Create DMG
+      - name: Create DMG installer
         run: |
-          mkdir -p dmg_content
-          cp dist/XiaozhiDiagnostic dmg_content/
+          mkdir -p dmg_staging
+          cp -R dist/XiaozhiDiagnostic.app dmg_staging/
+          ln -s /Applications dmg_staging/Applications
           hdiutil create -volname "XiaozhiDiagnostic" \
-            -srcfolder dmg_content \
+            -srcfolder dmg_staging \
             -ov -format UDZO \
+            -imagekey zlib-level=9 \
             XiaozhiDiagnostic-macOS.dmg
 
       - name: Upload artifact

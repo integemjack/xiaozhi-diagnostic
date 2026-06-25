@@ -2767,6 +2767,39 @@ class DiagnosticApp:
     def _verdict(self, widget, text, color):
         msg_queue.put(("verdict", widget, text, color))
 
+    def _copy_ota(self, url):
+        """Copy the OTA address to the clipboard and confirm with a toast."""
+        try:
+            self.root.clipboard_clear()
+            self.root.clipboard_append(url)
+            self.root.update()  # keep clipboard contents available after exit
+            self._toast(f"✔ OTA address copied\n{url}")
+        except Exception:
+            # Fallback to a modal dialog if the clipboard isn't available
+            messagebox.showinfo("OTA address copied", url)
+
+    def _toast(self, message, ms=1800):
+        """Small auto-dismissing notification centered near the bottom of the
+        main window (non-blocking)."""
+        try:
+            t = tk.Toplevel(self.root)
+            t.overrideredirect(True)
+            t.attributes("-topmost", True)
+            tk.Label(t, text=message, bg="#22a056", fg="white",
+                     font=("Helvetica", 11, "bold"), padx=18, pady=12,
+                     justify="center").pack()
+            self.root.update_idletasks()
+            t.update_idletasks()
+            rx, ry = self.root.winfo_rootx(), self.root.winfo_rooty()
+            rw, rh = self.root.winfo_width(), self.root.winfo_height()
+            tw, th = t.winfo_width(), t.winfo_height()
+            x = rx + (rw - tw) // 2
+            y = ry + rh - th - 70
+            t.geometry(f"+{x}+{y}")
+            t.after(ms, t.destroy)
+        except Exception:
+            pass
+
     def _set_buttons(self, enabled):
         st = "normal" if enabled else "disabled"
         self.btn_server.config(state=st)
@@ -2801,7 +2834,18 @@ class DiagnosticApp:
                     w.config(state="disabled")
                 elif kind == "verdict":
                     w, text, color = msg[1], msg[2], msg[3]
-                    w.config(text=f"  {text}", bg=color)
+                    # If the status bar shows an OTA address (e.g. the green
+                    # "All done" state), make it clickable to copy that address.
+                    m = re.search(r"http://[\d.]+:\d+/xiaozhi/ota/", text)
+                    if m:
+                        url = m.group(0)
+                        w.config(text=f"  {text}    👉 Click to copy OTA address",
+                                 bg=color, cursor="hand2")
+                        w.unbind("<Button-1>")
+                        w.bind("<Button-1>", lambda e, u=url: self._copy_ota(u))
+                    else:
+                        w.config(text=f"  {text}", bg=color, cursor="")
+                        w.unbind("<Button-1>")
                 elif kind == "clear":
                     w = msg[1]
                     w.config(state="normal")

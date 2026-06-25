@@ -456,16 +456,21 @@ class DiagnosticApp:
         """Build the Download & Deploy tab."""
         bar = ttk.Frame(self.tab_deploy)
         bar.pack(fill="x", padx=8, pady=6)
-        self.btn_download = ttk.Button(bar, text="Download Xiaozhi Package",
-                                       command=self._start_download)
-        self.btn_download.pack(side="left", padx=4)
-        self.btn_docker_start = ttk.Button(bar, text="Start Docker Services",
-                                           command=self._start_docker_services,
-                                           state="disabled")
-        self.btn_docker_start.pack(side="left", padx=4)
-        self.btn_docker_check = ttk.Button(bar, text="Check Docker Status",
-                                           command=self._start_docker_check)
-        self.btn_docker_check.pack(side="left", padx=4)
+        self.btn_one_click_start = ttk.Button(bar, text="One-Click Start",
+                                              command=self._start_one_click)
+        self.btn_one_click_start.pack(side="left", padx=4)
+        self.btn_change_ip = ttk.Button(bar, text="Change Server IP",
+                                        command=self._start_change_ip)
+        self.btn_change_ip.pack(side="left", padx=4)
+        self.btn_redownload = ttk.Button(bar, text="Re-download",
+                                         command=self._start_redownload)
+        self.btn_redownload.pack(side="left", padx=4)
+        self.btn_stop_containers = ttk.Button(bar, text="Stop Containers",
+                                              command=self._start_stop_containers)
+        self.btn_stop_containers.pack(side="left", padx=4)
+        self.btn_open_admin = ttk.Button(bar, text="Open Admin Panel",
+                                         command=self._open_admin_panel)
+        self.btn_open_admin.pack(side="left", padx=4)
 
         pane = ttk.PanedWindow(self.tab_deploy, orient="horizontal")
         pane.pack(fill="both", expand=True, padx=8, pady=4)
@@ -479,14 +484,539 @@ class DiagnosticApp:
         pane.add(self.deploy_log, weight=1)
 
         self.deploy_verdict = tk.Label(self.tab_deploy,
-                                       text="  Click [Download Xiaozhi Package] to download and deploy",
+                                       text="  Click [One-Click Start] to download, deploy, and configure",
                                        bg="#3c424e", fg="white", anchor="w",
                                        font=("Helvetica", 12, "bold"), padx=14, pady=10)
         self.deploy_verdict.pack(fill="x", side="bottom")
 
-    def _start_download(self):
-        """Start download xiaozhi package in background thread."""
-        self._start_worker(self._worker_download)
+    def _start_stop_containers(self):
+        """Stop all Docker containers."""
+        self._start_worker(self._worker_stop_containers)
+
+    def _worker_stop_containers(self):
+        """Worker thread: stop all xiaozhi Docker containers."""
+        L, LOG, V = self.deploy_list, self.deploy_log, self.deploy_verdict
+        msg_queue.put(("clear", L)); msg_queue.put(("clear", LOG))
+        msg_queue.put(("progress", "indeterminate"))
+        self._verdict(V, "Stopping Docker containers...", "#3c424e")
+        self._log(LOG, "===== Stopping Containers =====")
+
+        rc, _ = run_cmd("docker info", timeout=10)
+        if rc != 0:
+            self._item(L, "\u2718", "Docker is not running")
+            self._verdict(V, "Docker is not running.", "#d69e14")
+            msg_queue.put(("progress", 0))
+            msg_queue.put(("done",))
+            return
+
+        compose_file = self._find_compose_file()
+        if os.path.exists(compose_file):
+            rc_test, _ = run_cmd("docker compose version", timeout=10)
+            if rc_test == 0:
+                down_cmd = f'docker compose -p xiaozhi -f "{compose_file}" down'
+            else:
+                down_cmd = f'docker-compose -p xiaozhi -f "{compose_file}" down'
+
+            self._item(L, "\u2022", "Running docker compose down...")
+            self._log(LOG, f"Running: {down_cmd}")
+            rc, out = run_cmd(down_cmd, timeout=60)
+            if out:
+                for line in out.split("\n")[-10:]:
+                    self._log(LOG, line)
+
+            if rc == 0:
+                self._item(L, "\u2714", "All containers stopped and removed")
+                self._verdict(V, "All containers stopped.", "#22a056")
+            else:
+                self._item(L, "!", "docker compose down had issues")
+                self._log(LOG, f"[WARN] Exit code: {rc}")
+                self._verdict(V, "Containers may not have stopped cleanly.", "#d69e14")
+        else:
+            self._item(L, "\u2718", "No docker-compose file found")
+            self._verdict(V, "No compose file found.", "#ce3a3a")
+
+        msg_queue.put(("progress", 0))
+        msg_queue.put(("done",))
+
+    def _open_admin_panel(self):
+        """Open the admin management panel in browser using the configured server IP."""
+        import webbrowser
+
+        # Try to get the current server IP
+        server_ip = None
+
+        # First try from .last_ip file
+        last_ip_path = os.path.join(SCRIPT_DIR, ".last_ip")
+        if os.path.exists(last_ip_path):
+            try:
+                with open(last_ip_path) as f:
+                    ip = f.read().strip()
+                if re.match(r"\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}", ip):
+                    server_ip = ip
+            except Exception:
+                pass
+
+        # Fallback: try from database
+        if not server_ip:
+            try:
+                server_ip = self._get_current_ip_from_db()
+            except Exception:
+                pass
+
+        # Fallback: use localhost
+        if not server_ip:
+            server_ip = "localhost"
+
+        url = f"http://{server_ip}:{WEB_PORT}/#/params-management"
+        webbrowser.open(url)
+
+    def _start_one_click(self):
+        """One-click: download + docker start + change IP."""
+        self._force_redownload = False
+        self._start_worker(self._worker_one_click)
+
+    def _start_redownload(self):
+        """Force re-download then full start."""
+        self._force_redownload = True
+        self._start_worker(self._worker_one_click)
+
+    def _worker_one_click(self):
+        """One-click worker: download → start Docker → start services → change IP."""
+        L, LOG, V = self.deploy_list, self.deploy_log, self.deploy_verdict
+        msg_queue.put(("clear", L)); msg_queue.put(("clear", LOG))
+        msg_queue.put(("progress", "indeterminate"))
+        self._verdict(V, "Starting one-click deployment...", "#3c424e")
+        self._log(LOG, "========== One-Click Start ==========")
+        self._log(LOG, "")
+
+        target_dir = SCRIPT_DIR
+        zip_path = os.path.join(target_dir, XIAOZHI_ZIP_NAME)
+        force = getattr(self, '_force_redownload', False)
+
+        # If re-download, stop existing containers first
+        if force:
+            self._log(LOG, "===== Stopping existing containers =====")
+            self._item(L, "\u2022", "Stopping existing Docker containers...")
+            self._verdict(V, "Stopping existing containers...", "#3c424e")
+
+            rc, _ = run_cmd("docker info", timeout=10)
+            if rc == 0:
+                compose_file = self._find_compose_file()
+                if os.path.exists(compose_file):
+                    # Try docker compose down to stop and remove containers
+                    rc_test, _ = run_cmd("docker compose version", timeout=10)
+                    if rc_test == 0:
+                        down_cmd = f'docker compose -p xiaozhi -f "{compose_file}" down'
+                    else:
+                        down_cmd = f'docker-compose -p xiaozhi -f "{compose_file}" down'
+                    self._log(LOG, f"Running: {down_cmd}")
+                    rc, out = run_cmd(down_cmd, timeout=60)
+                    if rc == 0:
+                        self._item(L, "\u2714", "Containers stopped and removed")
+                        self._log(LOG, "[OK] Containers stopped")
+                    else:
+                        self._log(LOG, f"[WARN] docker compose down: {out[:200]}")
+                        self._item(L, "!", "Some containers may still be running")
+                else:
+                    self._log(LOG, "[INFO] No compose file found, skipping stop")
+            else:
+                self._log(LOG, "[INFO] Docker not running, nothing to stop")
+            self._log(LOG, "")
+
+        # ===== Phase 1: Download & Extract =====
+        self._log(LOG, "===== Phase 1: Download & Extract =====")
+        self._item(L, "\u2022", "Phase 1: Checking package...")
+
+        if os.path.exists(zip_path) and not force:
+            self._item(L, "\u2714", f"{XIAOZHI_ZIP_NAME} exists, skipping download")
+            self._log(LOG, f"[INFO] File exists: {zip_path} ({os.path.getsize(zip_path) // (1024*1024)} MB)")
+        else:
+            if force and os.path.exists(zip_path):
+                os.remove(zip_path)
+                self._item(L, "\u2022", "Re-downloading...")
+            self._verdict(V, "Phase 1: Downloading package...", "#3c424e")
+            if not self._do_download(zip_path, L, LOG, V):
+                msg_queue.put(("progress", 0))
+                msg_queue.put(("done",))
+                return
+
+        # Verify and extract
+        self._verdict(V, "Phase 1: Extracting...", "#3c424e")
+        try:
+            with zipfile.ZipFile(zip_path, 'r') as zf:
+                bad_file = zf.testzip()
+                if bad_file:
+                    raise zipfile.BadZipFile(f"Corrupt file: {bad_file}")
+                self._safe_extract(zf, target_dir, LOG)
+            self._item(L, "\u2714", "Package extracted")
+            self._log(LOG, "[OK] Extraction complete")
+
+            if IS_MAC:
+                for root_dir, dirs, files in os.walk(target_dir):
+                    for fname in files:
+                        if fname.endswith(('.sh', '.command', '.py')):
+                            try:
+                                os.chmod(os.path.join(root_dir, fname), 0o755)
+                            except OSError:
+                                pass
+                self._log(LOG, "[OK] macOS permissions fixed")
+
+        except zipfile.BadZipFile as e:
+            self._item(L, "!", f"Zip corrupt, re-downloading...")
+            self._log(LOG, f"[WARN] {str(e)}, re-downloading...")
+            try:
+                os.remove(zip_path)
+            except OSError:
+                pass
+            if not self._do_download(zip_path, L, LOG, V):
+                msg_queue.put(("progress", 0))
+                msg_queue.put(("done",))
+                return
+            try:
+                with zipfile.ZipFile(zip_path, 'r') as zf:
+                    self._safe_extract(zf, target_dir, LOG)
+                self._item(L, "\u2714", "Re-download and extract OK")
+            except Exception as e2:
+                self._item(L, "\u2718", f"Extract failed: {str(e2)}")
+                self._verdict(V, f"Extract failed: {str(e2)}", "#ce3a3a")
+                msg_queue.put(("progress", 0))
+                msg_queue.put(("done",))
+                return
+        except Exception as e:
+            self._item(L, "\u2718", f"Extract error: {str(e)}")
+            self._verdict(V, f"Extract error: {str(e)}", "#ce3a3a")
+            msg_queue.put(("progress", 0))
+            msg_queue.put(("done",))
+            return
+
+        if self.cancel:
+            msg_queue.put(("progress", 0)); msg_queue.put(("done",)); return
+
+        # ===== Phase 2: Docker =====
+        self._log(LOG, "")
+        self._log(LOG, "===== Phase 2: Docker Engine =====")
+        self._item(L, "\u2022", "Phase 2: Checking Docker...")
+        self._verdict(V, "Phase 2: Checking Docker...", "#3c424e")
+
+        # Check if Docker is installed
+        docker_installed = self._check_docker_installed(L, LOG)
+        if not docker_installed:
+            self._item(L, "\u2718", "Docker not installed, attempting install...")
+            install_ok = self._install_docker(L, LOG, V)
+            if not install_ok:
+                self._verdict(V, "Docker installation failed.", "#ce3a3a")
+                msg_queue.put(("progress", 0))
+                msg_queue.put(("done",))
+                return
+
+        # Check if Docker is running
+        rc, _ = run_cmd("docker info", timeout=15)
+        if rc != 0:
+            self._item(L, "\u2022", "Starting Docker Desktop...")
+            started = self._launch_docker_desktop(L, LOG)
+            if started:
+                self._verdict(V, "Phase 2: Waiting for Docker to start...", "#3c424e")
+                docker_ready = False
+                for i in range(60):
+                    if self.cancel:
+                        msg_queue.put(("progress", 0)); msg_queue.put(("done",)); return
+                    time.sleep(2)
+                    rc2, _ = run_cmd("docker info", timeout=5)
+                    if rc2 == 0:
+                        docker_ready = True
+                        break
+                    self._verdict(V, f"Phase 2: Waiting for Docker... ({(i+1)*2}s)", "#3c424e")
+                if not docker_ready:
+                    self._item(L, "\u2718", "Docker failed to start")
+                    self._verdict(V, "Docker failed to start.", "#ce3a3a")
+                    msg_queue.put(("progress", 0))
+                    msg_queue.put(("done",))
+                    return
+            else:
+                self._verdict(V, "Could not start Docker.", "#ce3a3a")
+                msg_queue.put(("progress", 0))
+                msg_queue.put(("done",))
+                return
+
+        self._item(L, "\u2714", "Docker is running")
+        self._log(LOG, "[OK] Docker engine ready")
+
+        if self.cancel:
+            msg_queue.put(("progress", 0)); msg_queue.put(("done",)); return
+
+        # ===== Phase 3: Start Services =====
+        self._log(LOG, "")
+        self._log(LOG, "===== Phase 3: Start Services =====")
+        self._item(L, "\u2022", "Phase 3: Starting services...")
+        self._verdict(V, "Phase 3: Starting Docker services...", "#3c424e")
+
+        compose_file = self._find_compose_file()
+        if not os.path.exists(compose_file):
+            self._item(L, "\u2718", "docker-compose file not found")
+            self._verdict(V, "No docker-compose file found.", "#ce3a3a")
+            msg_queue.put(("progress", 0))
+            msg_queue.put(("done",))
+            return
+
+        # Determine compose command
+        compose_cmd = None
+        rc_test, _ = run_cmd("docker compose version", timeout=10)
+        if rc_test == 0:
+            compose_cmd = f'docker compose -p xiaozhi -f "{compose_file}" up -d'
+        else:
+            rc_test2, _ = run_cmd("docker-compose version", timeout=10)
+            if rc_test2 == 0:
+                compose_cmd = f'docker-compose -p xiaozhi -f "{compose_file}" up -d'
+
+        if not compose_cmd:
+            self._item(L, "\u2718", "Docker Compose not found")
+            self._verdict(V, "Docker Compose not available.", "#ce3a3a")
+            msg_queue.put(("progress", 0))
+            msg_queue.put(("done",))
+            return
+
+        self._log(LOG, f"Running: {compose_cmd}")
+        rc, out = run_cmd(compose_cmd, timeout=1800)
+        if out:
+            for line in out.split("\n")[-15:]:
+                self._log(LOG, line)
+
+        if rc != 0:
+            self._item(L, "\u2718", "docker compose up failed")
+            self._verdict(V, "Docker compose up failed.", "#ce3a3a")
+            msg_queue.put(("progress", 0))
+            msg_queue.put(("done",))
+            return
+
+        self._item(L, "\u2714", "Docker compose up completed")
+
+        # Wait for containers to be ready
+        self._item(L, "\u2022", "Waiting for all services to be ready...")
+        self._verdict(V, "Phase 3: Waiting for containers...", "#3c424e")
+        max_wait = 300
+        check_interval = 5
+        elapsed = 0
+
+        while elapsed < max_wait:
+            if self.cancel:
+                msg_queue.put(("progress", 0)); msg_queue.put(("done",)); return
+            time.sleep(check_interval)
+            elapsed += check_interval
+
+            fmt = "{{.Names}}|{{.Status}}"
+            if IS_WIN:
+                rc, ps_out = run_cmd(f'docker ps --format "{fmt}"', timeout=10)
+            else:
+                rc, ps_out = run_cmd(f"docker ps --format '{fmt}'", timeout=10)
+
+            running_containers = {}
+            if ps_out:
+                for line in ps_out.strip().split("\n"):
+                    line = line.strip().strip("'").strip('"')
+                    if "|" in line:
+                        name, status = line.split("|", 1)
+                        running_containers[name.strip()] = status.strip()
+
+            running_count = sum(1 for c in CONTAINERS if c in running_containers)
+            total_count = len(CONTAINERS)
+
+            all_healthy = True
+            for c in CONTAINERS:
+                if c in running_containers:
+                    if "health: starting" in running_containers[c].lower():
+                        all_healthy = False
+                else:
+                    all_healthy = False
+
+            self._verdict(V, f"Phase 3: {running_count}/{total_count} containers ({elapsed}s)", "#3c424e")
+
+            if running_count == total_count and all_healthy:
+                break
+        else:
+            self._log(LOG, f"[WARN] Timeout after {max_wait}s")
+
+        self._item(L, "\u2714", "Services are running")
+        self._log(LOG, "[OK] All containers ready")
+
+        if self.cancel:
+            msg_queue.put(("progress", 0)); msg_queue.put(("done",)); return
+
+        # ===== Phase 4: Configure Server IP =====
+        self._log(LOG, "")
+        self._log(LOG, "===== Phase 4: Configure Server IP =====")
+        self._item(L, "\u2022", "Phase 4: Configuring server IP...")
+        self._verdict(V, "Phase 4: Configuring server IP...", "#3c424e")
+
+        # Get current IP from DB
+        current_ip = self._get_current_ip_from_db()
+        if current_ip:
+            self._log(LOG, f"Current IP in database: {current_ip}")
+        else:
+            self._log(LOG, "[INFO] No IP found in database (first run)")
+            current_ip = ""
+
+        # Detect LAN IPs
+        lan_ips = get_lan_ips()
+        if not lan_ips:
+            self._item(L, "!", "No LAN IP detected, skipping IP config")
+            self._log(LOG, "[WARN] No LAN IP, skipping")
+        else:
+            self._log(LOG, f"Detected LAN IPs: {', '.join(lan_ips)}")
+
+            # Always let user confirm/select IP
+            if len(lan_ips) == 1:
+                # Only one IP, auto-use it but still inform user
+                new_ip = lan_ips[0]
+                self._item(L, "\u2714", f"Detected IP: {new_ip}")
+                self._log(LOG, f"Only one IP detected, using: {new_ip}")
+            else:
+                # Multiple IPs, user must select
+                self._item(L, "\u2022", "Multiple IPs detected, please select...")
+                new_ip = self._ask_user_select_ip(lan_ips, current_ip)
+                if not new_ip:
+                    # User cancelled, pick first 192.168.x.x or first available
+                    new_ip = next((ip for ip in lan_ips if ip.startswith("192.168.")), lan_ips[0])
+                    self._log(LOG, f"Auto-selected: {new_ip}")
+
+            # Apply IP change if needed
+            if current_ip and current_ip == new_ip:
+                self._item(L, "\u2714", f"IP already correct: {new_ip}")
+                self._log(LOG, "IP unchanged, refreshing Redis cache...")
+                run_cmd("docker exec xiaozhi-esp32-server-redis redis-cli FLUSHALL", timeout=10)
+            else:
+                self._item(L, "\u2022", f"Setting IP: {current_ip or '(default)'} → {new_ip}")
+                old_ip = current_ip if current_ip else "192.168.20.42"
+                sql_update = (
+                    f"UPDATE sys_params SET param_value = REPLACE(param_value, '{old_ip}', '{new_ip}') "
+                    f"WHERE param_value LIKE '%{old_ip}%'; "
+                    f"UPDATE ai_model_config SET config_json = REPLACE(config_json, '{old_ip}', '{new_ip}') "
+                    f"WHERE config_json LIKE '%{old_ip}%';"
+                )
+                cmd = f'docker exec {DB_CONTAINER} mysql -u{DB_USER} -p{DB_PASS} {DB_NAME} -e "{sql_update}"'
+                rc, out = run_cmd(cmd, timeout=30)
+                if rc == 0:
+                    self._item(L, "\u2714", f"IP updated to {new_ip}")
+                    self._log(LOG, "[OK] Database IP updated")
+                else:
+                    self._item(L, "\u2718", f"IP update failed: {out[:100]}")
+                    self._log(LOG, f"[FAIL] {out}")
+
+                # Flush Redis
+                run_cmd("docker exec xiaozhi-esp32-server-redis redis-cli FLUSHALL", timeout=10)
+                self._log(LOG, "[OK] Redis cache cleared")
+
+                # Save .last_ip
+                try:
+                    with open(os.path.join(SCRIPT_DIR, ".last_ip"), "w") as f:
+                        f.write(new_ip)
+                except Exception:
+                    pass
+
+                # Restart services to apply new IP
+                self._item(L, "\u2022", "Restarting services to apply IP...")
+                self._verdict(V, "Restarting services...", "#3c424e")
+                restart_cmd = f'docker compose -p xiaozhi -f "{compose_file}" restart'
+                run_cmd(restart_cmd, timeout=120)
+                time.sleep(10)
+                self._item(L, "\u2714", "Services restarted")
+
+            # Show final OTA address
+            ota_addr = f"http://{new_ip}:{WEB_PORT}/xiaozhi/ota/"
+            self._item(L, "\u2714", f"Device OTA: {ota_addr}")
+            self._log(LOG, "")
+            self._log(LOG, f"Device OTA address: {ota_addr}")
+            self._log(LOG, "  (trailing slash '/' is REQUIRED)")
+
+        if self.cancel:
+            msg_queue.put(("progress", 0)); msg_queue.put(("done",)); return
+
+        # ===== Phase 5: Final Status Check =====
+        self._log(LOG, "")
+        self._log(LOG, "===== Phase 5: Final Status Check =====")
+        self._item(L, "\u2022", "Phase 5: Verifying all services...")
+        self._verdict(V, "Phase 5: Final verification...", "#3c424e")
+
+        # Wait a moment for services to stabilize after restart
+        time.sleep(5)
+
+        self._verify_docker_services(L, LOG, V)
+
+        # Override verdict with full OTA info if all OK
+        fmt = "{{.Names}}"
+        if IS_WIN:
+            rc, out = run_cmd(f'docker ps --format "{fmt}"', timeout=10)
+        else:
+            rc, out = run_cmd(f"docker ps --format '{fmt}'", timeout=10)
+        running = [x.strip().strip("'").strip('"') for x in (out or "").split("\n") if x.strip()]
+        all_running = all(c in running for c in CONTAINERS)
+
+        # ===== Done =====
+        self._log(LOG, "")
+        self._log(LOG, "========== One-Click Start Complete ==========")
+        ota_display = f"http://{new_ip}:{WEB_PORT}/xiaozhi/ota/" if lan_ips else ""
+        if all_running:
+            self._verdict(V, f"All done! All services running. OTA: {ota_display}", "#22a056")
+        else:
+            self._verdict(V, f"Done, but some services have issues. OTA: {ota_display}", "#d69e14")
+
+        msg_queue.put(("progress", 0))
+        msg_queue.put(("done",))
+
+    def _ask_user_select_ip(self, lan_ips, current_ip):
+        """Show dialog for user to select IP. Returns selected IP or None."""
+        selected_ip = [None]
+        dialog_done = [False]
+
+        def show_dialog():
+            dialog = tk.Toplevel(self.root)
+            dialog.title("Select Server IP")
+            dialog.geometry("400x300")
+            dialog.transient(self.root)
+            dialog.grab_set()
+
+            tk.Label(dialog, text="Multiple network IPs detected.",
+                     font=("Helvetica", 10)).pack(padx=10, pady=(10, 0), anchor="w")
+            if current_ip:
+                tk.Label(dialog, text=f"Current: {current_ip}",
+                         font=("Consolas", 10), fg="#2266aa").pack(padx=10, pady=(0, 5), anchor="w")
+
+            tk.Label(dialog, text="Select the IP for your Xiaozhi server:",
+                     font=("Helvetica", 10)).pack(padx=10, pady=(5, 5), anchor="w")
+
+            listbox = tk.Listbox(dialog, font=("Consolas", 12), height=6)
+            listbox.pack(fill="both", expand=True, padx=10, pady=5)
+            for ip in lan_ips:
+                display = f"{ip}  ← current" if ip == current_ip else ip
+                listbox.insert("end", display)
+
+            if current_ip in lan_ips:
+                listbox.selection_set(lan_ips.index(current_ip))
+            else:
+                listbox.selection_set(0)
+
+            def on_confirm():
+                sel = listbox.curselection()
+                if sel:
+                    selected_ip[0] = lan_ips[sel[0]]
+                dialog.destroy()
+                dialog_done[0] = True
+
+            def on_cancel():
+                dialog.destroy()
+                dialog_done[0] = True
+
+            btn_frame = ttk.Frame(dialog)
+            btn_frame.pack(fill="x", padx=10, pady=10)
+            ttk.Button(btn_frame, text="Confirm", command=on_confirm).pack(side="left", padx=5)
+            ttk.Button(btn_frame, text="Cancel", command=on_cancel).pack(side="left", padx=5)
+            dialog.protocol("WM_DELETE_WINDOW", on_cancel)
+
+        self.root.after(0, show_dialog)
+        while not dialog_done[0]:
+            if self.cancel:
+                return None
+            time.sleep(0.1)
+        return selected_ip[0]
 
     def _start_docker_services(self):
         """Start docker services in background thread."""
@@ -496,24 +1026,310 @@ class DiagnosticApp:
         """Check docker status in background thread."""
         self._start_worker(self._worker_docker_check)
 
-    def _worker_download(self):
-        """Worker thread: download xiaozhi.zip and extract to current directory."""
-        import urllib.request
-        import urllib.error
+    def _start_change_ip(self):
+        """Start the change IP workflow."""
+        self._start_worker(self._worker_change_ip)
 
+    def _worker_change_ip(self):
+        """Worker thread: detect LAN IPs, let user pick one, update database."""
         L, LOG, V = self.deploy_list, self.deploy_log, self.deploy_verdict
         msg_queue.put(("clear", L)); msg_queue.put(("clear", LOG))
         msg_queue.put(("progress", "indeterminate"))
-        self._verdict(V, "Downloading Xiaozhi package...", "#3c424e")
+        self._verdict(V, "Preparing to change server IP...", "#3c424e")
+        self._log(LOG, "===== Change Server IP =====")
 
-        # Target directory is where the executable/script is located
-        target_dir = SCRIPT_DIR
-        zip_path = os.path.join(target_dir, XIAOZHI_ZIP_NAME)
+        # Check Docker is running
+        rc, _ = run_cmd("docker info", timeout=10)
+        if rc != 0:
+            self._item(L, "\u2718", "Docker is not running")
+            self._verdict(V, "Docker must be running to change IP.", "#ce3a3a")
+            msg_queue.put(("progress", 0))
+            msg_queue.put(("done",))
+            return
 
-        # Download
+        # Check DB container is running
+        fmt = "{{.Names}}"
+        if IS_WIN:
+            rc, out = run_cmd(f'docker ps --format "{fmt}"', timeout=10)
+        else:
+            rc, out = run_cmd(f"docker ps --format '{fmt}'", timeout=10)
+        running = [x.strip().strip("'").strip('"') for x in (out or "").split("\n") if x.strip()]
+        if DB_CONTAINER not in running:
+            self._item(L, "\u2718", f"{DB_CONTAINER} is not running")
+            self._verdict(V, "Database container must be running to change IP.", "#ce3a3a")
+            msg_queue.put(("progress", 0))
+            msg_queue.put(("done",))
+            return
+
+        # Get current IP from database
+        self._item(L, "\u2022", "Reading current IP from database...")
+        current_ip = self._get_current_ip_from_db()
+        if current_ip:
+            self._item(L, "\u2714", f"Current IP in database: {current_ip}")
+            self._log(LOG, f"Current IP: {current_ip}")
+        else:
+            self._item(L, "!", "Could not read current IP from database (may be first run)")
+            self._log(LOG, "[INFO] No IP found in database, will set fresh")
+            current_ip = ""
+
+        # Detect LAN IPs
+        self._item(L, "\u2022", "Detecting LAN IP addresses...")
+        lan_ips = get_lan_ips()
+        if not lan_ips:
+            self._item(L, "\u2718", "No LAN IP detected")
+            self._verdict(V, "No LAN IP address found on this machine.", "#ce3a3a")
+            msg_queue.put(("progress", 0))
+            msg_queue.put(("done",))
+            return
+
+        for ip in lan_ips:
+            marker = " (current)" if ip == current_ip else ""
+            self._item(L, "\u2022", f"  {ip}{marker}")
+        self._log(LOG, f"Detected IPs: {', '.join(lan_ips)}")
+
+        # If current IP is already one of the LAN IPs, note that
+        if current_ip in lan_ips:
+            self._item(L, "\u2714", f"Current IP {current_ip} matches this machine")
+
+        # Ask user to select IP via dialog
+        self._verdict(V, "Please select the new server IP...", "#3c424e")
+        msg_queue.put(("progress", 0))
+
+        selected_ip = [None]
+        dialog_done = [False]
+
+        def show_ip_dialog():
+            dialog = tk.Toplevel(self.root)
+            dialog.title("Select Server IP")
+            dialog.geometry("400x300")
+            dialog.transient(self.root)
+            dialog.grab_set()
+
+            tk.Label(dialog, text="Current IP in database:",
+                     font=("Helvetica", 10)).pack(padx=10, pady=(10, 0), anchor="w")
+            tk.Label(dialog, text=f"  {current_ip if current_ip else '(not set)'}",
+                     font=("Consolas", 11, "bold"), fg="#2266aa").pack(padx=10, pady=(0, 10), anchor="w")
+
+            tk.Label(dialog, text="Select new server IP:",
+                     font=("Helvetica", 10)).pack(padx=10, pady=(5, 5), anchor="w")
+
+            listbox = tk.Listbox(dialog, font=("Consolas", 12), height=6)
+            listbox.pack(fill="both", expand=True, padx=10, pady=5)
+            for ip in lan_ips:
+                display = f"{ip}  ← current" if ip == current_ip else ip
+                listbox.insert("end", display)
+
+            # Pre-select the current IP or first one
+            if current_ip in lan_ips:
+                listbox.selection_set(lan_ips.index(current_ip))
+            else:
+                listbox.selection_set(0)
+
+            def on_confirm():
+                sel = listbox.curselection()
+                if sel:
+                    selected_ip[0] = lan_ips[sel[0]]
+                dialog.destroy()
+                dialog_done[0] = True
+
+            def on_cancel():
+                dialog.destroy()
+                dialog_done[0] = True
+
+            btn_frame = ttk.Frame(dialog)
+            btn_frame.pack(fill="x", padx=10, pady=10)
+            ttk.Button(btn_frame, text="Confirm", command=on_confirm).pack(side="left", padx=5)
+            ttk.Button(btn_frame, text="Cancel", command=on_cancel).pack(side="left", padx=5)
+
+            dialog.protocol("WM_DELETE_WINDOW", on_cancel)
+
+        self.root.after(0, show_ip_dialog)
+
+        # Wait for dialog
+        while not dialog_done[0]:
+            if self.cancel:
+                msg_queue.put(("done",))
+                return
+            time.sleep(0.1)
+
+        if not selected_ip[0]:
+            self._item(L, "!", "IP change cancelled")
+            self._verdict(V, "IP change cancelled by user.", "#3c424e")
+            msg_queue.put(("done",))
+            return
+
+        new_ip = selected_ip[0]
+        self._item(L, "\u2022", f"Selected new IP: {new_ip}")
+        self._log(LOG, f"New IP selected: {new_ip}")
+
+        if current_ip and current_ip == new_ip:
+            # Same IP, just refresh Redis
+            self._item(L, "\u2022", "IP unchanged, refreshing Redis cache...")
+            run_cmd("docker exec xiaozhi-esp32-server-redis redis-cli FLUSHALL", timeout=10)
+            self._item(L, "\u2714", "Redis cache cleared")
+            self._verdict(V, f"IP unchanged ({new_ip}). Redis cache refreshed.", "#22a056")
+            msg_queue.put(("done",))
+            return
+
+        # Perform IP replacement in database
+        msg_queue.put(("progress", "indeterminate"))
+        self._verdict(V, f"Replacing IP: {current_ip} → {new_ip} ...", "#3c424e")
+        self._log(LOG, f"Replacing {current_ip} -> {new_ip} in database...")
+
+        if current_ip:
+            # Replace old IP with new IP
+            sql_update = (
+                f"UPDATE sys_params SET param_value = REPLACE(param_value, '{current_ip}', '{new_ip}') "
+                f"WHERE param_value LIKE '%{current_ip}%'; "
+                f"UPDATE ai_model_config SET config_json = REPLACE(config_json, '{current_ip}', '{new_ip}') "
+                f"WHERE config_json LIKE '%{current_ip}%';"
+            )
+        else:
+            # No old IP - update websocket and ota URLs with new IP
+            sql_update = (
+                f"UPDATE sys_params SET param_value = REPLACE(param_value, '192.168.20.42', '{new_ip}') "
+                f"WHERE param_value LIKE '%192.168.20.42%'; "
+                f"UPDATE ai_model_config SET config_json = REPLACE(config_json, '192.168.20.42', '{new_ip}') "
+                f"WHERE config_json LIKE '%192.168.20.42%';"
+            )
+
+        cmd = f'docker exec {DB_CONTAINER} mysql -u{DB_USER} -p{DB_PASS} {DB_NAME} -e "{sql_update}"'
+        rc, out = run_cmd(cmd, timeout=30)
+
+        if rc == 0:
+            self._item(L, "\u2714", "Database updated successfully")
+            self._log(LOG, "[OK] Database IP replaced")
+        else:
+            self._item(L, "\u2718", f"Database update failed: {out}")
+            self._log(LOG, f"[FAIL] SQL error: {out}")
+            self._verdict(V, "Database update failed. Check logs.", "#ce3a3a")
+            msg_queue.put(("progress", 0))
+            msg_queue.put(("done",))
+            return
+
+        # Flush Redis cache
+        self._item(L, "\u2022", "Clearing Redis cache...")
+        run_cmd("docker exec xiaozhi-esp32-server-redis redis-cli FLUSHALL", timeout=10)
+        self._item(L, "\u2714", "Redis cache cleared")
+        self._log(LOG, "[OK] Redis FLUSHALL")
+
+        # Save new IP to .last_ip file
+        last_ip_path = os.path.join(SCRIPT_DIR, ".last_ip")
+        try:
+            with open(last_ip_path, "w") as f:
+                f.write(new_ip)
+            self._log(LOG, f"Saved new IP to: {last_ip_path}")
+        except Exception:
+            pass
+
+        # Verify the replacement
+        self._item(L, "\u2022", "Verifying...")
+        verify_sql = (
+            f"SELECT param_code, param_value FROM sys_params "
+            f"WHERE param_value LIKE '%{new_ip}%'"
+        )
+        verify_out = docker_exec_sql(verify_sql)
+        if verify_out:
+            self._log(LOG, "")
+            self._log(LOG, "Verified - configs with new IP:")
+            for line in verify_out.strip().split("\n"):
+                self._log(LOG, f"  {line}")
+            self._item(L, "\u2714", f"IP changed: {current_ip or '(default)'} → {new_ip}")
+        else:
+            self._log(LOG, "[WARN] Could not verify, but update may have succeeded")
+
+        # Restart services to apply
+        self._item(L, "\u2022", "Restarting services to apply new IP...")
+        self._verdict(V, "Restarting services...", "#3c424e")
+
+        if IS_WIN:
+            rc, out = run_cmd(f'docker compose -p xiaozhi -f "{self._find_compose_file()}" restart', timeout=120)
+        else:
+            rc, out = run_cmd(f"docker compose -p xiaozhi -f '{self._find_compose_file()}' restart", timeout=120)
+
+        if rc == 0:
+            self._item(L, "\u2714", "Services restarted")
+            self._log(LOG, "[OK] Services restarted")
+        else:
+            self._item(L, "!", "Restart may have issues, check Docker status")
+            self._log(LOG, f"[WARN] Restart output: {out[:200]}")
+
+        ota_addr = f"http://{new_ip}:{WEB_PORT}/xiaozhi/ota/"
+        self._verdict(V, f"Done! Server IP: {new_ip} | Device OTA: {ota_addr}", "#22a056")
+        self._log(LOG, "")
+        self._log(LOG, f"Device OTA address: {ota_addr}")
+        self._log(LOG, "  (trailing slash '/' is REQUIRED)")
+
+        msg_queue.put(("progress", 0))
+        msg_queue.put(("done",))
+
+    def _get_current_ip_from_db(self):
+        """Read the current server IP from database sys_params."""
+        # Try to get from websocket URL or OTA URL in sys_params
+        out = docker_exec_sql(
+            "SELECT param_value FROM sys_params WHERE param_code IN ('websocket_url','ota_url') LIMIT 1"
+        )
+        if out:
+            # Extract IP from URL like ws://192.168.1.5:8000/xiaozhi/v1/
+            m = re.search(r"(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})", out)
+            if m:
+                return m.group(1)
+        # Fallback: read from .last_ip file
+        last_ip_path = os.path.join(SCRIPT_DIR, ".last_ip")
+        if os.path.exists(last_ip_path):
+            try:
+                with open(last_ip_path) as f:
+                    ip = f.read().strip()
+                if re.match(r"\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}", ip):
+                    return ip
+            except Exception:
+                pass
+        return None
+
+    def _find_compose_file(self):
+        """Find the docker-compose file path."""
+        for name in ["docker-compose_all.yml", "docker-compose.yml"]:
+            path = os.path.join(SCRIPT_DIR, name)
+            if os.path.exists(path):
+                return path
+        return "docker-compose_all.yml"
+
+    def _safe_extract(self, zf, target_dir, LOG):
+        """Extract zip contents safely, skipping files that can't be created on this OS."""
+        skipped = []
+        # Files to skip: Unix sockets, device files, or names problematic on Windows
+        skip_suffixes = ('.sock', '.socket')
+
+        for member in zf.infolist():
+            if self.cancel:
+                return skipped
+            # Skip Unix socket files and other special files
+            if any(member.filename.endswith(s) for s in skip_suffixes):
+                skipped.append(member.filename)
+                continue
+            # Skip empty entries with no name
+            if not member.filename:
+                continue
+            try:
+                zf.extract(member, target_dir)
+            except (OSError, IOError) as e:
+                # Skip files that can't be extracted on this platform
+                skipped.append(f"{member.filename} ({str(e)})")
+                self._log(LOG, f"  [SKIP] {member.filename}: {str(e)}")
+            except Exception as e:
+                skipped.append(f"{member.filename} ({str(e)})")
+                self._log(LOG, f"  [SKIP] {member.filename}: {str(e)}")
+
+        if skipped:
+            self._log(LOG, f"  Skipped {len(skipped)} file(s) incompatible with this OS")
+        return skipped
+
+    def _do_download(self, zip_path, L, LOG, V):
+        """Perform the actual file download. Returns True if successful."""
+        import urllib.request
+
         try:
             self._item(L, "\u2022", f"Downloading from: {XIAOZHI_ZIP_URL}")
-            self._log(LOG, f"Target directory: {target_dir}")
             self._log(LOG, f"Downloading {XIAOZHI_ZIP_URL} ...")
 
             req = urllib.request.Request(XIAOZHI_ZIP_URL)
@@ -529,9 +1345,7 @@ class DiagnosticApp:
                 while True:
                     if self.cancel:
                         self._verdict(V, "Download cancelled.", "#d69e14")
-                        msg_queue.put(("progress", 0))
-                        msg_queue.put(("done",))
-                        return
+                        return False
                     chunk = resp.read(block_size)
                     if not chunk:
                         break
@@ -543,23 +1357,62 @@ class DiagnosticApp:
                                       f"Downloading... {downloaded // (1024*1024)} MB / {total_size // (1024*1024)} MB ({pct}%)",
                                       "#3c424e")
 
-            self._item(L, "\u2714", f"Download complete: {XIAOZHI_ZIP_NAME}")
+            self._item(L, "\u2714", f"Download complete: {XIAOZHI_ZIP_NAME} ({downloaded // (1024*1024)} MB)")
             self._log(LOG, f"Download complete. Size: {downloaded // (1024*1024)} MB")
+            return True
 
         except Exception as e:
             self._item(L, "\u2718", f"Download failed: {str(e)}")
             self._log(LOG, f"[FAIL] Download error: {str(e)}")
             self._verdict(V, f"Download failed: {str(e)}", "#ce3a3a")
-            msg_queue.put(("progress", 0))
-            msg_queue.put(("done",))
-            return
+            return False
 
-        # Extract
-        self._verdict(V, "Extracting zip file...", "#3c424e")
-        self._log(LOG, "Extracting zip file...")
+    def _worker_download(self):
+        """Worker thread: download xiaozhi.zip and extract to current directory."""
+        L, LOG, V = self.deploy_list, self.deploy_log, self.deploy_verdict
+        msg_queue.put(("clear", L)); msg_queue.put(("clear", LOG))
+        msg_queue.put(("progress", "indeterminate"))
+
+        target_dir = SCRIPT_DIR
+        zip_path = os.path.join(target_dir, XIAOZHI_ZIP_NAME)
+        force = getattr(self, '_force_redownload', False)
+
+        self._log(LOG, f"Target directory: {target_dir}")
+
+        # Check if zip already exists
+        if os.path.exists(zip_path) and not force:
+            self._item(L, "\u2714", f"{XIAOZHI_ZIP_NAME} already exists, skipping download")
+            self._log(LOG, f"[INFO] File exists: {zip_path}")
+            self._log(LOG, f"  Size: {os.path.getsize(zip_path) // (1024*1024)} MB")
+            self._log(LOG, "  Use [Re-download] to force re-download")
+            self._verdict(V, "File exists, verifying zip integrity...", "#3c424e")
+        else:
+            if force:
+                self._item(L, "\u2022", "Force re-download requested")
+                self._log(LOG, "[INFO] Re-downloading...")
+                if os.path.exists(zip_path):
+                    os.remove(zip_path)
+            self._verdict(V, "Downloading Xiaozhi package...", "#3c424e")
+            if not self._do_download(zip_path, L, LOG, V):
+                msg_queue.put(("progress", 0))
+                msg_queue.put(("done",))
+                return
+
+        # Extract - verify zip first
+        self._verdict(V, "Verifying and extracting zip file...", "#3c424e")
+        self._log(LOG, "Verifying zip integrity...")
         try:
             with zipfile.ZipFile(zip_path, 'r') as zf:
-                zf.extractall(target_dir)
+                bad_file = zf.testzip()
+                if bad_file:
+                    raise zipfile.BadZipFile(f"Corrupt file in archive: {bad_file}")
+                self._item(L, "\u2714", "Zip file integrity OK")
+                self._log(LOG, "[OK] Zip file is valid")
+
+                # Extract
+                self._verdict(V, "Extracting files...", "#3c424e")
+                self._log(LOG, "Extracting...")
+                self._safe_extract(zf, target_dir, LOG)
 
             self._item(L, "\u2714", "Extraction complete")
             self._log(LOG, f"Files extracted to: {target_dir}")
@@ -588,15 +1441,56 @@ class DiagnosticApp:
                           "Download & extract complete! Click [Start Docker Services] to deploy.",
                           "#22a056")
 
-            # Enable docker start button
+            # Enable docker start button, change download button to re-download
             self.root.after(0, lambda: self.btn_docker_start.config(state="normal"))
+            self.root.after(0, lambda: self.btn_download.config(text="Re-download", command=self._start_redownload))
 
-        except zipfile.BadZipFile:
-            self._item(L, "\u2718", "Invalid zip file")
-            self._verdict(V, "Extract failed: invalid zip file", "#ce3a3a")
+        except zipfile.BadZipFile as e:
+            self._item(L, "\u2718", f"Zip file is corrupt: {str(e)}")
+            self._log(LOG, f"[FAIL] Bad zip file: {str(e)}")
+            self._log(LOG, "  Deleting corrupt file and re-downloading...")
+            self._verdict(V, "Zip file corrupt, re-downloading...", "#d69e14")
+
+            # Delete bad file and re-download
+            try:
+                os.remove(zip_path)
+            except OSError:
+                pass
+
+            if not self._do_download(zip_path, L, LOG, V):
+                msg_queue.put(("progress", 0))
+                msg_queue.put(("done",))
+                return
+
+            # Try extract again
+            try:
+                with zipfile.ZipFile(zip_path, 'r') as zf:
+                    self._safe_extract(zf, target_dir, LOG)
+                self._item(L, "\u2714", "Re-download and extraction successful")
+
+                if IS_MAC:
+                    for root_dir, dirs, files in os.walk(target_dir):
+                        for fname in files:
+                            fpath = os.path.join(root_dir, fname)
+                            if fname.endswith(('.sh', '.command', '.py')):
+                                try:
+                                    os.chmod(fpath, 0o755)
+                                except OSError:
+                                    pass
+                    for pattern in ['*.command', '*.sh']:
+                        run_cmd(f'find "{target_dir}" -name "{pattern}" -exec chmod +x {{}} \\;', timeout=10)
+
+                self._verdict(V, "Re-download & extract complete! Click [Start Docker Services] to deploy.", "#22a056")
+                self.root.after(0, lambda: self.btn_docker_start.config(state="normal"))
+                self.root.after(0, lambda: self.btn_download.config(text="Re-download", command=self._start_redownload))
+
+            except Exception as e2:
+                self._item(L, "\u2718", f"Extract still failed: {str(e2)}")
+                self._verdict(V, f"Extract failed after re-download: {str(e2)}", "#ce3a3a")
+
         except PermissionError as e:
             self._item(L, "\u2718", f"Permission denied: {str(e)}")
-            self._verdict(V, f"Extract failed: permission denied", "#ce3a3a")
+            self._verdict(V, "Extract failed: permission denied", "#ce3a3a")
         except Exception as e:
             self._item(L, "\u2718", f"Extract error: {str(e)}")
             self._verdict(V, f"Extract error: {str(e)}", "#ce3a3a")
@@ -611,33 +1505,67 @@ class DiagnosticApp:
         msg_queue.put(("progress", "indeterminate"))
         self._verdict(V, "Starting Docker services...", "#3c424e")
 
-        # Step 1: Check if Docker is installed and running
-        self._item(L, "\u2022", "Checking Docker...")
+        # Step 1: Check if Docker is installed
+        self._item(L, "\u2022", "Checking Docker installation...")
         self._log(LOG, "===== Docker pre-check =====")
+
+        docker_installed = self._check_docker_installed(L, LOG)
+        if not docker_installed:
+            self._item(L, "\u2718", "Docker is NOT installed")
+            self._log(LOG, "[FAIL] Docker is not installed on this system")
+            self._log(LOG, "")
+            self._verdict(V, "Docker not installed. Attempting to install...", "#d69e14")
+
+            # Try to install Docker automatically
+            install_ok = self._install_docker(L, LOG, V)
+            if not install_ok:
+                self._verdict(V, "Docker installation failed. Please install Docker manually.", "#ce3a3a")
+                msg_queue.put(("progress", 0))
+                msg_queue.put(("done",))
+                return
+
+        # Step 2: Check if Docker is running
+        self._item(L, "\u2022", "Checking if Docker is running...")
         rc, out = run_cmd("docker info", timeout=15)
         if rc != 0:
-            self._item(L, "\u2718", "Docker is NOT running")
-            self._log(LOG, f"[FAIL] docker info returned: {out}")
-            self._log(LOG, "")
-            self._log(LOG, "Please start Docker Desktop first:")
-            if IS_WIN:
-                self._log(LOG, "  - Open Docker Desktop from Start Menu")
-                self._log(LOG, "  - Or run: start \"\" \"C:\\Program Files\\Docker\\Docker\\Docker Desktop.exe\"")
-            elif IS_MAC:
-                self._log(LOG, "  - Open Docker Desktop from Applications")
-                self._log(LOG, "  - Or run: open -a Docker")
+            self._item(L, "\u2718", "Docker is NOT running, attempting to start...")
+            self._log(LOG, "[INFO] Docker not running, trying to start Docker Desktop...")
+
+            # Try to start Docker Desktop automatically
+            started = self._launch_docker_desktop(L, LOG)
+
+            if started:
+                # Wait for Docker to be ready
+                self._item(L, "\u2022", "Waiting for Docker to be ready...")
+                self._verdict(V, "Docker Desktop is starting, please wait...", "#3c424e")
+                docker_ready = False
+                for i in range(60):  # Wait up to 60 seconds
+                    if self.cancel:
+                        msg_queue.put(("progress", 0))
+                        msg_queue.put(("done",))
+                        return
+                    time.sleep(2)
+                    rc2, _ = run_cmd("docker info", timeout=5)
+                    if rc2 == 0:
+                        docker_ready = True
+                        break
+                    self._verdict(V, f"Waiting for Docker... ({(i+1)*2}s)", "#3c424e")
+
+                if docker_ready:
+                    self._item(L, "\u2714", "Docker Desktop started successfully")
+                    self._log(LOG, "[OK] Docker is now running")
+                else:
+                    self._item(L, "\u2718", "Docker failed to start within 120 seconds")
+                    self._log(LOG, "[FAIL] Docker did not become ready in time")
+                    self._verdict(V, "Docker failed to start. Please start Docker Desktop manually.", "#ce3a3a")
+                    msg_queue.put(("progress", 0))
+                    msg_queue.put(("done",))
+                    return
             else:
-                self._log(LOG, "  - Run: sudo systemctl start docker")
-            self._verdict(V, "Docker is NOT running! Start Docker Desktop first, then try again.", "#ce3a3a")
-            self.root.after(0, lambda: messagebox.showerror(
-                "Docker Not Running",
-                "Docker is not running.\n\n"
-                "Please start Docker Desktop first, wait for it to be ready,\n"
-                "then click [Start Docker Services] again."
-            ))
-            msg_queue.put(("progress", 0))
-            msg_queue.put(("done",))
-            return
+                self._verdict(V, "Could not start Docker. Please start Docker Desktop manually.", "#ce3a3a")
+                msg_queue.put(("progress", 0))
+                msg_queue.put(("done",))
+                return
 
         self._item(L, "\u2714", "Docker is running")
         self._log(LOG, "[OK] Docker is running")
@@ -671,11 +1599,11 @@ class DiagnosticApp:
         compose_cmd = None
         rc_test, _ = run_cmd("docker compose version", timeout=10)
         if rc_test == 0:
-            compose_cmd = f'docker compose -f "{compose_file}" up -d'
+            compose_cmd = f'docker compose -p xiaozhi -f "{compose_file}" up -d'
         else:
             rc_test2, _ = run_cmd("docker-compose version", timeout=10)
             if rc_test2 == 0:
-                compose_cmd = f'docker-compose -f "{compose_file}" up -d'
+                compose_cmd = f'docker-compose -p xiaozhi -f "{compose_file}" up -d'
 
         if not compose_cmd:
             self._item(L, "\u2718", "docker compose command not found")
@@ -686,7 +1614,7 @@ class DiagnosticApp:
             return
 
         self._log(LOG, f"Running: {compose_cmd}")
-        rc, out = run_cmd(compose_cmd, timeout=300)
+        rc, out = run_cmd(compose_cmd, timeout=1800)
         if out:
             for line in out.split("\n")[-20:]:
                 self._log(LOG, line)
@@ -702,14 +1630,95 @@ class DiagnosticApp:
         self._item(L, "\u2714", "Docker compose up completed")
         self._log(LOG, "")
 
-        # Step 4: Wait and verify services
-        self._item(L, "\u2022", "Waiting for services to be ready (15s)...")
-        self._verdict(V, "Waiting for services to initialize...", "#3c424e")
-        time.sleep(15)
+        # Step 4: Wait for all containers to be running and healthy
+        self._item(L, "\u2022", "Waiting for all services to be ready...")
+        self._verdict(V, "Waiting for containers to start...", "#3c424e")
+        self._log(LOG, "===== Waiting for services =====")
 
-        # Step 5: Check all containers
+        max_wait = 300  # Maximum 5 minutes
+        check_interval = 5  # Check every 5 seconds
+        elapsed = 0
+
+        while elapsed < max_wait:
+            if self.cancel:
+                self._log(LOG, "Cancelled by user.")
+                msg_queue.put(("progress", 0))
+                msg_queue.put(("done",))
+                return
+
+            time.sleep(check_interval)
+            elapsed += check_interval
+
+            # Check how many containers are running
+            fmt = "{{.Names}}|{{.Status}}"
+            if IS_WIN:
+                rc, out = run_cmd(f'docker ps --format "{fmt}"', timeout=10)
+            else:
+                rc, out = run_cmd(f"docker ps --format '{fmt}'", timeout=10)
+
+            running_containers = {}
+            if out:
+                for line in out.strip().split("\n"):
+                    line = line.strip().strip("'").strip('"')
+                    if "|" in line:
+                        name, status = line.split("|", 1)
+                        running_containers[name.strip()] = status.strip()
+
+            # Count how many of our containers are up
+            running_count = sum(1 for c in CONTAINERS if c in running_containers)
+            total_count = len(CONTAINERS)
+
+            # Check if containers with healthcheck are healthy
+            all_healthy = True
+            for c in CONTAINERS:
+                if c in running_containers:
+                    status = running_containers[c].lower()
+                    if "health: starting" in status:
+                        all_healthy = False
+                else:
+                    all_healthy = False
+
+            self._verdict(V,
+                          f"Waiting... {running_count}/{total_count} containers running ({elapsed}s elapsed)",
+                          "#3c424e")
+            self._log(LOG, f"  [{elapsed}s] {running_count}/{total_count} running, healthy={all_healthy}")
+
+            # All containers running and healthy - done!
+            if running_count == total_count and all_healthy:
+                self._item(L, "\u2714", f"All {total_count} containers are ready ({elapsed}s)")
+                self._log(LOG, f"[OK] All containers ready after {elapsed}s")
+                break
+
+            # If some containers exited/restarting, show details
+            for c in CONTAINERS:
+                if c in running_containers:
+                    status = running_containers[c]
+                    if "restarting" in status.lower():
+                        self._log(LOG, f"  [WARN] {c} is restarting: {status}")
+        else:
+            # Timeout reached
+            self._item(L, "!", f"Timeout: not all services ready after {max_wait}s")
+            self._log(LOG, f"[WARN] Timeout after {max_wait}s, some services may still be starting")
+
+        # Step 5: Final verification
+        self._log(LOG, "")
         self._log(LOG, "===== Post-start verification =====")
         self._verify_docker_services(L, LOG, V)
+
+        # Step 6: Prompt to change IP after successful start
+        # Check if all containers are running before offering IP change
+        fmt = "{{.Names}}"
+        if IS_WIN:
+            rc, out = run_cmd(f'docker ps --format "{fmt}"', timeout=10)
+        else:
+            rc, out = run_cmd(f"docker ps --format '{fmt}'", timeout=10)
+        running = [x.strip().strip("'").strip('"') for x in (out or "").split("\n") if x.strip()]
+        all_running = all(c in running for c in CONTAINERS)
+
+        if all_running:
+            self._item(L, "\u2714", "Services ready! You can now change server IP if needed.")
+            self._log(LOG, "")
+            self._log(LOG, "[TIP] Click [Change Server IP] to update the server address in database.")
 
         msg_queue.put(("progress", 0))
         msg_queue.put(("done",))
@@ -742,10 +1751,300 @@ class DiagnosticApp:
         msg_queue.put(("progress", 0))
         msg_queue.put(("done",))
 
+    def _check_docker_installed(self, L, LOG):
+        """Check if Docker is installed on the system."""
+        if IS_WIN:
+            # Check if docker.exe exists in PATH or common locations
+            rc, out = run_cmd("where docker", timeout=10)
+            if rc == 0 and out.strip():
+                self._log(LOG, f"  Docker found at: {out.strip().split(chr(10))[0]}")
+                return True
+            # Check common install paths
+            paths = [
+                r"C:\Program Files\Docker\Docker\resources\bin\docker.exe",
+                r"C:\Program Files\Docker\Docker\Docker Desktop.exe",
+                os.path.expandvars(r"%ProgramFiles%\Docker\Docker\resources\bin\docker.exe"),
+            ]
+            for p in paths:
+                if os.path.exists(p):
+                    self._log(LOG, f"  Docker found at: {p}")
+                    return True
+            return False
+        elif IS_MAC:
+            rc, out = run_cmd("which docker", timeout=5)
+            if rc == 0 and out.strip():
+                self._log(LOG, f"  Docker found at: {out.strip()}")
+                return True
+            # Check if Docker.app exists
+            if os.path.exists("/Applications/Docker.app"):
+                self._log(LOG, "  Docker.app found in Applications")
+                return True
+            return False
+        else:
+            # Linux
+            rc, out = run_cmd("which docker", timeout=5)
+            if rc == 0 and out.strip():
+                self._log(LOG, f"  Docker found at: {out.strip()}")
+                return True
+            return False
+
+    def _install_docker(self, L, LOG, V):
+        """Attempt to install Docker automatically. Returns True if successful."""
+        import urllib.request
+        import urllib.error
+
+        if IS_WIN:
+            self._item(L, "\u2022", "Downloading Docker Desktop for Windows...")
+            self._log(LOG, "Downloading Docker Desktop installer...")
+            self._verdict(V, "Downloading Docker Desktop installer...", "#3c424e")
+
+            installer_url = "https://desktop.docker.com/win/main/amd64/Docker%20Desktop%20Installer.exe"
+            installer_path = os.path.join(SCRIPT_DIR, "DockerDesktopInstaller.exe")
+
+            try:
+                req = urllib.request.Request(installer_url)
+                req.add_header("User-Agent", "XiaozhiDiagnostic/1.0")
+                resp = urllib.request.urlopen(req, timeout=300)
+
+                total_size = resp.headers.get("Content-Length")
+                total_size = int(total_size) if total_size else 0
+                downloaded = 0
+                block_size = 65536
+
+                with open(installer_path, "wb") as f:
+                    while True:
+                        if self.cancel:
+                            return False
+                        chunk = resp.read(block_size)
+                        if not chunk:
+                            break
+                        f.write(chunk)
+                        downloaded += len(chunk)
+                        if total_size:
+                            pct = int(downloaded / total_size * 100)
+                            self._verdict(V,
+                                          f"Downloading Docker... {downloaded // (1024*1024)} MB / {total_size // (1024*1024)} MB ({pct}%)",
+                                          "#3c424e")
+
+                self._item(L, "\u2714", "Docker installer downloaded")
+                self._log(LOG, f"Installer saved to: {installer_path}")
+
+                # Run installer silently
+                self._item(L, "\u2022", "Installing Docker Desktop (this may take a few minutes)...")
+                self._verdict(V, "Installing Docker Desktop... please wait", "#3c424e")
+                self._log(LOG, "Running installer with install --quiet flag...")
+                rc, out = run_cmd(f'"{installer_path}" install --quiet', timeout=600)
+
+                if rc == 0:
+                    self._item(L, "\u2714", "Docker Desktop installed successfully")
+                    self._log(LOG, "[OK] Docker Desktop installed")
+                    # Clean up installer
+                    try:
+                        os.remove(installer_path)
+                    except OSError:
+                        pass
+                    return True
+                else:
+                    self._item(L, "\u2718", "Docker installer returned an error")
+                    self._log(LOG, f"[WARN] Installer exit code: {rc}")
+                    self._log(LOG, f"  Output: {out[:500]}")
+                    # It might still have installed, check again
+                    rc2, _ = run_cmd("where docker", timeout=10)
+                    if rc2 == 0:
+                        self._item(L, "\u2714", "Docker appears to be installed despite error")
+                        return True
+                    return False
+
+            except Exception as e:
+                self._item(L, "\u2718", f"Download/install failed: {str(e)}")
+                self._log(LOG, f"[FAIL] {str(e)}")
+                self._log(LOG, "")
+                self._log(LOG, "Please install Docker Desktop manually:")
+                self._log(LOG, "  https://www.docker.com/products/docker-desktop/")
+                self.root.after(0, lambda: messagebox.showwarning(
+                    "Install Docker Manually",
+                    "Automatic Docker installation failed.\n\n"
+                    "Please download and install Docker Desktop manually:\n"
+                    "https://www.docker.com/products/docker-desktop/\n\n"
+                    "After installation, click [Start Docker Services] again."
+                ))
+                return False
+
+        elif IS_MAC:
+            self._item(L, "\u2022", "Docker not installed on macOS")
+            self._log(LOG, "Attempting to install Docker via Homebrew...")
+
+            # Check if brew is available
+            rc, _ = run_cmd("which brew", timeout=5)
+            if rc == 0:
+                self._item(L, "\u2022", "Installing Docker via Homebrew (may take a while)...")
+                self._verdict(V, "Installing Docker via Homebrew...", "#3c424e")
+                rc, out = run_cmd("brew install --cask docker", timeout=600)
+                if rc == 0:
+                    self._item(L, "\u2714", "Docker Desktop installed via Homebrew")
+                    self._log(LOG, "[OK] Docker installed via brew")
+                    return True
+                else:
+                    self._log(LOG, f"[FAIL] brew install failed: {out[:300]}")
+
+            # Fallback: prompt user
+            self._item(L, "\u2718", "Cannot auto-install Docker on macOS")
+            self._log(LOG, "")
+            self._log(LOG, "Please install Docker Desktop manually:")
+            self._log(LOG, "  https://www.docker.com/products/docker-desktop/")
+            self._log(LOG, "  Or: brew install --cask docker")
+            self.root.after(0, lambda: messagebox.showwarning(
+                "Install Docker Manually",
+                "Docker is not installed.\n\n"
+                "Please install Docker Desktop for macOS:\n"
+                "https://www.docker.com/products/docker-desktop/\n\n"
+                "Or run: brew install --cask docker\n\n"
+                "After installation, click [Start Docker Services] again."
+            ))
+            return False
+
+        else:
+            # Linux: try to install via package manager
+            self._item(L, "\u2022", "Attempting to install Docker on Linux...")
+            self._log(LOG, "Trying to install Docker via package manager...")
+            self._verdict(V, "Installing Docker...", "#3c424e")
+
+            # Try the official convenience script
+            self._log(LOG, "  Trying official install script: get.docker.com")
+            rc, out = run_cmd("curl -fsSL https://get.docker.com | sh", timeout=300)
+            if rc == 0:
+                self._item(L, "\u2714", "Docker installed via get.docker.com")
+                self._log(LOG, "[OK] Docker installed")
+                # Enable and start docker service
+                run_cmd("sudo systemctl enable docker", timeout=10)
+                run_cmd("sudo systemctl start docker", timeout=15)
+                return True
+
+            # Try apt
+            self._log(LOG, "  Trying apt-get install...")
+            rc, out = run_cmd("sudo apt-get update && sudo apt-get install -y docker.io docker-compose-plugin", timeout=300)
+            if rc == 0:
+                self._item(L, "\u2714", "Docker installed via apt")
+                run_cmd("sudo systemctl enable docker", timeout=10)
+                run_cmd("sudo systemctl start docker", timeout=15)
+                return True
+
+            # Try yum/dnf
+            self._log(LOG, "  Trying yum/dnf install...")
+            rc, _ = run_cmd("which dnf", timeout=5)
+            pkg_cmd = "dnf" if rc == 0 else "yum"
+            rc, out = run_cmd(f"sudo {pkg_cmd} install -y docker docker-compose-plugin", timeout=300)
+            if rc == 0:
+                self._item(L, "\u2714", f"Docker installed via {pkg_cmd}")
+                run_cmd("sudo systemctl enable docker", timeout=10)
+                run_cmd("sudo systemctl start docker", timeout=15)
+                return True
+
+            self._item(L, "\u2718", "Could not auto-install Docker on Linux")
+            self._log(LOG, "[FAIL] All installation attempts failed")
+            self._log(LOG, "")
+            self._log(LOG, "Please install Docker manually:")
+            self._log(LOG, "  https://docs.docker.com/engine/install/")
+            self.root.after(0, lambda: messagebox.showwarning(
+                "Install Docker Manually",
+                "Automatic Docker installation failed.\n\n"
+                "Please install Docker manually:\n"
+                "https://docs.docker.com/engine/install/\n\n"
+                "After installation, click [Start Docker Services] again."
+            ))
+            return False
+
+    def _launch_docker_desktop(self, L, LOG):
+        """Try to launch Docker Desktop automatically. Returns True if launch command succeeded."""
+        try:
+            if IS_WIN:
+                # Windows: try common Docker Desktop paths
+                docker_paths = [
+                    r"C:\Program Files\Docker\Docker\Docker Desktop.exe",
+                    r"C:\Program Files (x86)\Docker\Docker\Docker Desktop.exe",
+                    os.path.expandvars(r"%ProgramFiles%\Docker\Docker\Docker Desktop.exe"),
+                    os.path.expandvars(r"%LocalAppData%\Docker\Docker Desktop.exe"),
+                ]
+                launched = False
+                for docker_path in docker_paths:
+                    if os.path.exists(docker_path):
+                        self._log(LOG, f"  Launching: {docker_path}")
+                        subprocess.Popen(
+                            [docker_path],
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL,
+                            creationflags=0x00000008  # DETACHED_PROCESS
+                        )
+                        launched = True
+                        break
+
+                if not launched:
+                    # Try via start command (searches PATH and Start Menu)
+                    self._log(LOG, "  Trying: start Docker Desktop via shell...")
+                    rc, _ = run_cmd('start "" "Docker Desktop"', timeout=10)
+                    if rc != 0:
+                        # Try powershell Start-Process
+                        rc, _ = run_cmd(
+                            'powershell -Command "Start-Process \'Docker Desktop\' -ErrorAction SilentlyContinue"',
+                            timeout=10
+                        )
+                    launched = True  # We attempted, let the wait loop verify
+
+                self._item(L, "\u2022", "Docker Desktop launch command sent (Windows)")
+                return launched
+
+            elif IS_MAC:
+                # macOS: use open -a Docker
+                self._log(LOG, "  Launching: open -a Docker")
+                rc, out = run_cmd("open -a Docker", timeout=10)
+                if rc == 0:
+                    self._item(L, "\u2022", "Docker Desktop launch command sent (macOS)")
+                    return True
+                else:
+                    # Try alternate path
+                    rc, _ = run_cmd("open /Applications/Docker.app", timeout=10)
+                    if rc == 0:
+                        self._item(L, "\u2022", "Docker Desktop launch command sent (macOS)")
+                        return True
+                    self._item(L, "\u2718", "Failed to launch Docker Desktop on macOS")
+                    self._log(LOG, f"  [FAIL] open -a Docker failed: {out}")
+                    return False
+
+            else:
+                # Linux: try systemctl to start docker daemon
+                self._log(LOG, "  Launching: systemctl start docker")
+                rc, out = run_cmd("systemctl start docker", timeout=15)
+                if rc == 0:
+                    self._item(L, "\u2022", "Docker daemon started (Linux systemctl)")
+                    return True
+                # Try without sudo (in case already has permissions)
+                self._log(LOG, f"  systemctl failed (rc={rc}), trying sudo...")
+                rc2, out2 = run_cmd("sudo systemctl start docker", timeout=15)
+                if rc2 == 0:
+                    self._item(L, "\u2022", "Docker daemon started (Linux sudo systemctl)")
+                    return True
+                # Try service command
+                rc3, _ = run_cmd("sudo service docker start", timeout=15)
+                if rc3 == 0:
+                    self._item(L, "\u2022", "Docker daemon started (Linux service)")
+                    return True
+                self._item(L, "\u2718", "Failed to start Docker on Linux")
+                self._log(LOG, f"  [FAIL] Could not start docker: {out2}")
+                return False
+
+        except Exception as e:
+            self._log(LOG, f"  [ERROR] Exception launching Docker: {str(e)}")
+            self._item(L, "\u2718", f"Error launching Docker: {str(e)}")
+            return False
+
     def _verify_docker_services(self, L, LOG, V):
         """Verify all Docker containers are running and healthy."""
-        # Check containers
-        rc, out = run_cmd("docker ps --format '{{.Names}}|{{.Status}}'", timeout=10)
+        # Check containers - use double quotes on Windows, single on Unix
+        fmt = "{{.Names}}|{{.Status}}"
+        if IS_WIN:
+            rc, out = run_cmd(f'docker ps --format "{fmt}"', timeout=10)
+        else:
+            rc, out = run_cmd(f"docker ps --format '{fmt}'", timeout=10)
         running_containers = {}
         if out:
             for line in out.strip().split("\n"):
@@ -902,6 +2201,11 @@ class DiagnosticApp:
         )
         self.btn_chat.config(state=st)
         self.btn_dev.config(state=st)
+        self.btn_one_click_start.config(state=st)
+        self.btn_change_ip.config(state=st)
+        self.btn_redownload.config(state=st)
+        self.btn_stop_containers.config(state=st)
+        self.btn_open_admin.config(state=st)
         self.btn_stop.config(state="disabled" if enabled else "normal")
 
     def _poll_queue(self):
@@ -991,9 +2295,12 @@ class DiagnosticApp:
         # Containers
         running = []
         if docker_ok:
-            rc, out = run_cmd("docker ps --format '{{.Names}}'")
+            if IS_WIN:
+                rc, out = run_cmd('docker ps --format "{{.Names}}"')
+            else:
+                rc, out = run_cmd("docker ps --format '{{.Names}}'")
             if out:
-                running = [x.strip().strip("'") for x in out.split("\n") if x.strip()]
+                running = [x.strip().strip("'").strip('"') for x in out.split("\n") if x.strip()]
         all_c = True
         for c in CONTAINERS:
             if self.cancel: msg_queue.put(("done",)); return

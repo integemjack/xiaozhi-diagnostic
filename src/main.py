@@ -15,6 +15,7 @@ import queue
 import socket
 import time
 import platform
+import zipfile
 
 # ==================== Configuration ====================
 def get_script_dir():
@@ -41,11 +42,13 @@ CONTAINERS = [
 # Minimum free memory (GB) required to fully start the Xiaozhi service.
 REQUIRED_FREE_GB = 4
 
-# Essential Xiaozhi files to verify for integrity: (relative path, min size in bytes, description)
+# Essential Xiaozhi files to verify for integrity:
+# (relative path, min size in bytes, description, deep_check)
+# deep_check: None = size only, "model" = also validate the model file is not corrupted.
 REQUIRED_FILES = [
-    ("docker-compose_all.yml", 1, "docker compose file"),
-    ("data/.config.yaml", 1, "config file"),
-    ("models/SenseVoiceSmall/model.pt", 400 * 1024 * 1024, "ASR model"),
+    ("docker-compose_all.yml", 1, "docker compose file", None),
+    ("data/.config.yaml", 1, "config file", None),
+    ("models/SenseVoiceSmall/model.pt", 400 * 1024 * 1024, "ASR model", "model"),
 ]
 
 IS_MAC = platform.system() == "Darwin"
@@ -209,40 +212,96 @@ class DiagnosticApp:
             self._verdict(self.env_mem_label, "Failed to get memory info", "#ce3a3a")
 
         # Check Xiaozhi file integrity (shown below the memory info)
+        self._verdict(self.env_integrity_label,
+                      "Verifying files and model integrity (this may take a moment)...",
+                      "#3c424e")
         self._check_file_integrity()
 
         msg_queue.put(("progress", 0))
         msg_queue.put(("done",))
 
     def _check_file_integrity(self):
-        """Verify essential Xiaozhi files exist and are not truncated."""
+        """Verify essential Xiaozhi files exist, are not truncated, and (for the
+        model) are not corrupted."""
         results = []
         all_ok = True
-        for rel_path, min_size, desc in REQUIRED_FILES:
+        for rel_path, min_size, desc, deep_check in REQUIRED_FILES:
             full_path = os.path.join(SCRIPT_DIR, rel_path)
             if not os.path.exists(full_path):
                 all_ok = False
                 results.append(f"  [MISSING] {rel_path} ({desc})")
-            else:
-                try:
-                    size = os.path.getsize(full_path)
-                except OSError:
-                    size = 0
-                if size < min_size:
+                continue
+
+            try:
+                size = os.path.getsize(full_path)
+            except OSError:
+                size = 0
+            if size < min_size:
+                all_ok = False
+                results.append(
+                    f"  [INCOMPLETE] {rel_path} - {size / (1024 ** 2):.1f} MB "
+                    f"(expected >= {min_size / (1024 ** 2):.1f} MB)")
+                continue
+
+            # Deep integrity check for the model file.
+            if deep_check == "model":
+                ok, detail = self._verify_model_file(full_path)
+                if not ok:
                     all_ok = False
-                    results.append(
-                        f"  [INCOMPLETE] {rel_path} - {size / (1024 ** 2):.1f} MB "
-                        f"(expected >= {min_size / (1024 ** 2):.1f} MB)")
-                else:
-                    results.append(f"  [OK] {rel_path} ({size / (1024 ** 2):.1f} MB)")
+                    results.append(f"  [CORRUPTED] {rel_path} - {detail}")
+                    continue
+                results.append(f"  [OK] {rel_path} ({size / (1024 ** 2):.1f} MB, {detail})")
+            else:
+                results.append(f"  [OK] {rel_path} ({size / (1024 ** 2):.1f} MB)")
 
         if all_ok:
             header = "File integrity OK - all essential Xiaozhi files are present and complete."
             color = "#22a056"
         else:
-            header = "File integrity FAILED - some Xiaozhi files are missing or incomplete:"
+            header = "File integrity FAILED - some Xiaozhi files are missing, incomplete or corrupted:"
             color = "#ce3a3a"
         self._verdict(self.env_integrity_label, header + "\n" + "\n".join(results), color)
+
+    def _verify_model_file(self, path):
+        """Validate a PyTorch .pt model file is not corrupted.
+
+        Modern PyTorch models are saved as ZIP archives. We verify the archive
+        structure and run a CRC check on every entry (zipfile.testzip), which
+        detects truncation and bit-rot without needing PyTorch installed.
+        Returns (ok: bool, detail: str).
+        """
+        try:
+            with open(path, "rb") as f:
+                head = f.read(4)
+        except OSError as e:
+            return False, f"cannot read file: {e}"
+
+        # PK\x03\x04 = ZIP-based PyTorch format (the common case).
+        if head[:2] == b"PK":
+            try:
+                with zipfile.ZipFile(path) as zf:
+                    bad = zf.testzip()  # returns name of first bad file, or None
+                    if bad is not None:
+                        return False, f"CRC check failed on entry: {bad}"
+                    names = zf.namelist()
+                    if not names:
+                        return False, "archive is empty"
+                    # A valid torch zip contains a 'data.pkl' entry.
+                    has_pickle = any(n.endswith("data.pkl") or n.endswith(".pkl")
+                                     for n in names)
+                    if not has_pickle:
+                        return False, "missing data.pkl (not a valid torch model)"
+                return True, "archive verified"
+            except zipfile.BadZipFile as e:
+                return False, f"bad zip archive: {e}"
+            except Exception as e:
+                return False, f"verification error: {e}"
+
+        # Legacy pickle format: magic bytes 0x80 0x02 (pickle protocol 2).
+        if head[:1] == b"\x80":
+            return True, "legacy pickle format (header OK)"
+
+        return False, "unrecognized model format (corrupted header)"
 
     def _get_system_memory(self):
         """Get system memory usage (cross-platform)."""

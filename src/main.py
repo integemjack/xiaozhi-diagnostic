@@ -38,6 +38,16 @@ CONTAINERS = [
     "xiaozhi-esp32-server-redis",
 ]
 
+# Minimum free memory (GB) required to fully start the Xiaozhi service.
+REQUIRED_FREE_GB = 4
+
+# Essential Xiaozhi files to verify for integrity: (relative path, min size in bytes, description)
+REQUIRED_FILES = [
+    ("docker-compose_all.yml", 1, "docker compose file"),
+    ("data/.config.yaml", 1, "config file"),
+    ("models/SenseVoiceSmall/model.pt", 400 * 1024 * 1024, "ASR model"),
+]
+
 IS_MAC = platform.system() == "Darwin"
 IS_WIN = platform.system() == "Windows"
 
@@ -157,60 +167,26 @@ class DiagnosticApp:
         self.btn_env_check = ttk.Button(bar, text="Check Memory",
                                         command=self._start_env_check)
         self.btn_env_check.pack(side="left", padx=4)
-        self.btn_kill_proc = ttk.Button(bar, text="Kill Selected Process",
-                                        command=self._kill_selected_process)
-        self.btn_kill_proc.pack(side="left", padx=4)
-        self.btn_env_refresh = ttk.Button(bar, text="Refresh Process List",
-                                          command=self._start_env_check)
-        self.btn_env_refresh.pack(side="left", padx=4)
-
-        # Search bar
-        search_frame = ttk.Frame(self.tab_env)
-        search_frame.pack(fill="x", padx=8, pady=2)
-        ttk.Label(search_frame, text="Filter:").pack(side="left", padx=4)
-        self.env_search_var = tk.StringVar()
-        self.env_search_var.trace_add("write", self._filter_process_list)
-        self.env_search_entry = ttk.Entry(search_frame, textvariable=self.env_search_var, width=30)
-        self.env_search_entry.pack(side="left", padx=4)
 
         # Memory summary label
-        self.env_mem_label = tk.Label(self.tab_env, text="  Click [Check Memory] to view system memory and process info",
+        self.env_mem_label = tk.Label(self.tab_env, text="  Click [Check Memory] to view system memory info",
                                      bg="#3c424e", fg="white", anchor="w",
                                      font=("Helvetica", 11, "bold"), padx=14, pady=8)
         self.env_mem_label.pack(fill="x", padx=8, pady=4)
 
-        # Process list treeview
-        proc_frame = ttk.Frame(self.tab_env)
-        proc_frame.pack(fill="both", expand=True, padx=8, pady=4)
-
-        cols = ("PID", "Name", "Memory (MB)", "CPU %", "Status")
-        self.proc_tree = ttk.Treeview(proc_frame, columns=cols, show="headings", height=18)
-        for c in cols:
-            self.proc_tree.heading(c, text=c, command=lambda col=c: self._sort_proc_tree(col))
-            self.proc_tree.column(c, width=120)
-        self.proc_tree.column("PID", width=70)
-        self.proc_tree.column("Name", width=250)
-        self.proc_tree.column("Memory (MB)", width=120)
-        self.proc_tree.column("CPU %", width=80)
-        self.proc_tree.column("Status", width=100)
-
-        # Scrollbar
-        proc_scroll = ttk.Scrollbar(proc_frame, orient="vertical", command=self.proc_tree.yview)
-        self.proc_tree.configure(yscrollcommand=proc_scroll.set)
-        self.proc_tree.pack(side="left", fill="both", expand=True)
-        proc_scroll.pack(side="right", fill="y")
-
-        # Store process data for filtering/sorting
-        self._proc_data = []
-        self._proc_sort_col = "Memory (MB)"
-        self._proc_sort_reverse = True
+        # File integrity label (shown below the memory info)
+        self.env_integrity_label = tk.Label(self.tab_env, text="  File integrity: not checked yet",
+                                             bg="#3c424e", fg="white", anchor="w",
+                                             justify="left",
+                                             font=("Helvetica", 10), padx=14, pady=8)
+        self.env_integrity_label.pack(fill="x", padx=8, pady=2)
 
     def _start_env_check(self):
         """Start environment check in a background thread."""
         self._start_worker(self._worker_env)
 
     def _worker_env(self):
-        """Worker thread: collect memory and process information."""
+        """Worker thread: collect memory information and check file integrity."""
         msg_queue.put(("progress", "indeterminate"))
         self._verdict(self.env_mem_label, "Collecting system information...", "#3c424e")
 
@@ -218,30 +194,55 @@ class DiagnosticApp:
         mem_info = self._get_system_memory()
         if mem_info:
             total_gb = mem_info["total"] / (1024 ** 3)
-            used_gb = mem_info["used"] / (1024 ** 3)
             free_gb = mem_info["free"] / (1024 ** 3)
-            pct = (mem_info["used"] / mem_info["total"]) * 100 if mem_info["total"] else 0
-            if pct > 90:
-                color = "#ce3a3a"
-            elif pct > 70:
-                color = "#d69e14"
-            else:
+            # Only check that there is enough free memory to fully start Xiaozhi.
+            if free_gb >= REQUIRED_FREE_GB:
                 color = "#22a056"
-            mem_text = (f"Memory: {used_gb:.1f} GB / {total_gb:.1f} GB used ({pct:.0f}%)  |  "
-                        f"Free: {free_gb:.1f} GB")
+                mem_text = (f"Memory OK: {free_gb:.1f} GB free / {total_gb:.1f} GB total  "
+                            f"(>= {REQUIRED_FREE_GB} GB required)")
+            else:
+                color = "#ce3a3a"
+                mem_text = (f"Insufficient memory: only {free_gb:.1f} GB free / {total_gb:.1f} GB total. "
+                            f"At least {REQUIRED_FREE_GB} GB free is required to fully start the Xiaozhi service.")
             self._verdict(self.env_mem_label, mem_text, color)
         else:
             self._verdict(self.env_mem_label, "Failed to get memory info", "#ce3a3a")
 
-        # Get process list
-        proc_list = self._get_process_list()
-        self._proc_data = proc_list
-
-        # Update tree on main thread
-        self.root.after(0, self._populate_proc_tree)
+        # Check Xiaozhi file integrity (shown below the memory info)
+        self._check_file_integrity()
 
         msg_queue.put(("progress", 0))
         msg_queue.put(("done",))
+
+    def _check_file_integrity(self):
+        """Verify essential Xiaozhi files exist and are not truncated."""
+        results = []
+        all_ok = True
+        for rel_path, min_size, desc in REQUIRED_FILES:
+            full_path = os.path.join(SCRIPT_DIR, rel_path)
+            if not os.path.exists(full_path):
+                all_ok = False
+                results.append(f"  [MISSING] {rel_path} ({desc})")
+            else:
+                try:
+                    size = os.path.getsize(full_path)
+                except OSError:
+                    size = 0
+                if size < min_size:
+                    all_ok = False
+                    results.append(
+                        f"  [INCOMPLETE] {rel_path} - {size / (1024 ** 2):.1f} MB "
+                        f"(expected >= {min_size / (1024 ** 2):.1f} MB)")
+                else:
+                    results.append(f"  [OK] {rel_path} ({size / (1024 ** 2):.1f} MB)")
+
+        if all_ok:
+            header = "File integrity OK - all essential Xiaozhi files are present and complete."
+            color = "#22a056"
+        else:
+            header = "File integrity FAILED - some Xiaozhi files are missing or incomplete:"
+            color = "#ce3a3a"
+        self._verdict(self.env_integrity_label, header + "\n" + "\n".join(results), color)
 
     def _get_system_memory(self):
         """Get system memory usage (cross-platform)."""

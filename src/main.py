@@ -303,27 +303,97 @@ class DiagnosticApp:
 
         return False, "unrecognized model format (corrupted header)"
 
+    def _get_windows_memory(self):
+        """Get Windows memory using layered fallbacks.
+
+        Many machines fail the PowerShell/WMI path (PowerShell locked down by
+        policy, PS 2.0 without Get-CimInstance, corrupted/slow WMI repository,
+        localized output, or cold-start exceeding the timeout). So we try the
+        most reliable method first:
+          1. ctypes -> kernel32.GlobalMemoryStatusEx  (no subprocess, no WMI,
+             works on every Windows version, returns instantly)
+          2. wmic OS  (independent of PowerShell)
+          3. PowerShell Get-CimInstance  (last resort)
+        Returns {"total","used","free"} in bytes, or None.
+        """
+        # --- Method 1: direct kernel call via ctypes (most reliable) ---
+        try:
+            import ctypes
+
+            class MEMORYSTATUSEX(ctypes.Structure):
+                _fields_ = [
+                    ("dwLength", ctypes.c_ulong),
+                    ("dwMemoryLoad", ctypes.c_ulong),
+                    ("ullTotalPhys", ctypes.c_ulonglong),
+                    ("ullAvailPhys", ctypes.c_ulonglong),
+                    ("ullTotalPageFile", ctypes.c_ulonglong),
+                    ("ullAvailPageFile", ctypes.c_ulonglong),
+                    ("ullTotalVirtual", ctypes.c_ulonglong),
+                    ("ullAvailVirtual", ctypes.c_ulonglong),
+                    ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+                ]
+
+            stat = MEMORYSTATUSEX()
+            stat.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
+            if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(stat)):
+                total = int(stat.ullTotalPhys)
+                free = int(stat.ullAvailPhys)
+                if total > 0:
+                    return {"total": total, "used": total - free, "free": free}
+        except Exception:
+            pass
+
+        # --- Method 2: wmic (does not depend on PowerShell) ---
+        try:
+            rc, out = run_cmd(
+                "wmic OS get TotalVisibleMemorySize,FreePhysicalMemory /format:list",
+                timeout=15
+            )
+            if rc == 0 and out:
+                total = free = 0
+                for line in out.split("\n"):
+                    line = line.strip()
+                    m = re.match(r"TotalVisibleMemorySize\s*=\s*(\d+)", line)
+                    if m:
+                        total = int(m.group(1)) * 1024  # KB -> bytes
+                    m = re.match(r"FreePhysicalMemory\s*=\s*(\d+)", line)
+                    if m:
+                        free = int(m.group(1)) * 1024
+                if total > 0:
+                    return {"total": total, "used": total - free, "free": free}
+        except Exception:
+            pass
+
+        # --- Method 3: PowerShell Get-CimInstance (last resort) ---
+        try:
+            rc, out = run_cmd(
+                'powershell -NoProfile -NonInteractive -Command '
+                '"Get-CimInstance Win32_OperatingSystem | '
+                'Select-Object TotalVisibleMemorySize,FreePhysicalMemory | Format-List"',
+                timeout=20
+            )
+            total = free = 0
+            for line in out.split("\n"):
+                line = line.strip()
+                # Tolerate localized labels by matching the key name + any digits.
+                m = re.search(r"TotalVisibleMemorySize\D*(\d+)", line)
+                if m:
+                    total = int(m.group(1)) * 1024
+                m = re.search(r"FreePhysicalMemory\D*(\d+)", line)
+                if m:
+                    free = int(m.group(1)) * 1024
+            if total > 0:
+                return {"total": total, "used": total - free, "free": free}
+        except Exception:
+            pass
+
+        return None
+
     def _get_system_memory(self):
         """Get system memory usage (cross-platform)."""
         try:
             if IS_WIN:
-                rc, out = run_cmd(
-                    'powershell -Command "Get-CimInstance Win32_OperatingSystem | Select-Object TotalVisibleMemorySize,FreePhysicalMemory | Format-List"',
-                    timeout=15
-                )
-                total = free = 0
-                for line in out.split("\n"):
-                    line = line.strip()
-                    if "TotalVisibleMemorySize" in line and ":" in line:
-                        val = line.split(":")[-1].strip()
-                        if val.isdigit():
-                            total = int(val) * 1024  # KB to bytes
-                    elif "FreePhysicalMemory" in line and ":" in line:
-                        val = line.split(":")[-1].strip()
-                        if val.isdigit():
-                            free = int(val) * 1024
-                if total:
-                    return {"total": total, "used": total - free, "free": free}
+                return self._get_windows_memory()
             else:
                 # macOS / Linux
                 if IS_MAC:

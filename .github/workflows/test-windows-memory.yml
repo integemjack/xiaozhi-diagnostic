@@ -1,0 +1,52 @@
+name: Test Windows Memory Detection
+
+on:
+  push:
+    branches: [ main, master, v2.1 ]
+    paths:
+      - 'src/main.py'
+      - 'tests/test_windows_memory.py'
+      - '.github/workflows/test-windows-memory.yml'
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  test-windows-memory:
+    name: Memory detection (${{ matrix.label }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # GitHub-hosted Windows runners share the NT kernel and memory APIs
+          # with their desktop counterparts, so these validate the Win10/Win11
+          # code paths (GlobalMemoryStatusEx / wmic / PowerShell CIM).
+          - os: windows-2019
+            label: "Server 2019 (Windows 10 kernel)"
+          - os: windows-2022
+            label: "Server 2022 (Windows 10/11 21H2 kernel)"
+          - os: windows-2025
+            label: "Server 2025 (Windows 11 24H2 kernel)"
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Show runner OS details
+        shell: pwsh
+        run: |
+          Write-Host "Runner image: ${{ matrix.os }}"
+          $os = Get-CimInstance Win32_OperatingSystem
+          Write-Host ("OS Caption : " + $os.Caption)
+          Write-Host ("OS Version : " + $os.Version)
+          Write-Host ("Build      : " + $os.BuildNumber)
+
+      - name: Run headless memory detection test
+        run: python tests/test_windows_memory.py

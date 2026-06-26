@@ -273,11 +273,25 @@ class DiagnosticApp:
                     rc2, vm_out = run_cmd("vm_stat", timeout=5)
                     free = 0
                     if rc2 == 0:
-                        page_size = 4096
-                        for m in re.finditer(r"Pages free:\s+(\d+)", vm_out):
-                            free += int(m.group(1)) * page_size
-                        for m in re.finditer(r"Pages inactive:\s+(\d+)", vm_out):
-                            free += int(m.group(1)) * page_size
+                        # Page size is NOT always 4096. Apple Silicon uses 16384.
+                        # Read it from vm_stat's own header so the page counts below
+                        # are scaled correctly; fall back to sysctl, then 4096.
+                        page_size = 0
+                        hdr = re.search(r"page size of (\d+) bytes", vm_out)
+                        if hdr:
+                            page_size = int(hdr.group(1))
+                        if not page_size:
+                            rcp, pout = run_cmd("sysctl -n hw.pagesize", timeout=5)
+                            if rcp == 0 and pout.strip().isdigit():
+                                page_size = int(pout.strip())
+                        if not page_size:
+                            page_size = 4096
+                        # Available memory = pages that are free or can be reclaimed
+                        # without paging out application memory.
+                        for label in ("free", "inactive", "speculative", "purgeable"):
+                            m = re.search(r"Pages %s:\s+(\d+)" % label, vm_out)
+                            if m:
+                                free += int(m.group(1)) * page_size
                     if total:
                         return {"total": total, "used": total - free, "free": free}
                 else:
